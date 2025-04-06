@@ -139,6 +139,9 @@ chmod 755 "${LAUNCHER_PATH}" || log_error "Failed to make launcher script execut
 chown root:root "${LAUNCHER_PATH}"
 log_info "Launcher script created and set as executable: ${LAUNCHER_PATH}"
 
+# Add .desktop
+cp ./Portage\ GUI.desktop /usr/share/applications/
+
 # --- Final Steps ---
 log_info ""
 log_info "-----------------------------------------------------"
