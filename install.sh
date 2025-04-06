@@ -136,7 +136,6 @@ chmod 755 "${LAUNCHER_PATH}" || log_error "Failed to make launcher script execut
 chown root:root "${LAUNCHER_PATH}"
 log_info "Launcher script created and set as executable: ${LAUNCHER_PATH}"
 
-EOF
 chmod 644 "${ALIAS_FILE}" # Make it readable by all users
 chown root:root "${ALIAS_FILE}"
 log_info "Aliases 'portagegui' and 'pgui' defined in ${ALIAS_FILE}."
