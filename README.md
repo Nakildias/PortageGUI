@@ -12,5 +12,4 @@ You can install it using the install.sh script
 
 You can open PortageGUI with
 > PortageGUI
-OR
-> Searching for PortageGUI in your installed applications
+>> OR Searching for PortageGUI in your installed applications
