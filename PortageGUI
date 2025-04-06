@@ -1,0 +1,29 @@
+#!/bin/bash
+# Launcher for PortageGUI Application
+
+# Define the paths based on the installation script setup
+VENV_DIR="/opt/PortageGUI"
+VENV_PATH="${VENV_DIR}/venv"
+PYTHON_SCRIPT_NAME="PortageGUI.py"
+VENV_PYTHON_EXEC="${VENV_PATH}/bin/python"
+APP_SCRIPT_PATH="${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
+
+# Basic checks for robustness (optional but good practice)
+if [[ ! -x "${VENV_PYTHON_EXEC}" ]]; then
+    echo "[PortageGUI Launcher Error] Python interpreter not found or not executable in venv: ${VENV_PYTHON_EXEC}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${APP_SCRIPT_PATH}" ]]; then
+    echo "[PortageGUI Launcher Error] Main Python script not found: ${APP_SCRIPT_PATH}" >&2
+    exit 1
+fi
+
+# Execute the Python script using the virtual environment's Python interpreter.
+# 'exec' replaces this wrapper process with the Python process.
+# '"$@"' forwards all command-line arguments passed to this wrapper script to the Python script.
+exec "${VENV_PYTHON_EXEC}" "${APP_SCRIPT_PATH}" "$@"
+
+# The script will exit with the exit code of the Python application because of 'exec'.
+# If exec fails (e.g., python interpreter gone missing after check), exit with an error.
+exit 127 # Standard exit code for "command not found" style errors
