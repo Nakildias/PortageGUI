@@ -121,7 +121,7 @@ log_info "Installing pip dependencies (ansi2html) into the virtual environment..
 "${VENV_PATH}/bin/python" -m pip install --upgrade pip || log_warning "Failed to upgrade pip in venv. Continuing..."
 # Install required packages
 # Note: PyQt6 should ideally be handled by emerge on Gentoo (done in step 4)
-"${VENV_PATH}/bin/python" -m pip install ansi2html || log_error "Failed to install pip dependencies (ansi2html) in venv."
+"${VENV_PATH}/bin/python" -m pip install ansi2html PyQt6 || log_error "Failed to install pip dependencies (ansi2html) in venv."
 log_info "Pip dependencies installed within the virtual environment."
 
 # 8. Create the launcher script in /usr/local/bin
