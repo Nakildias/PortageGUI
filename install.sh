@@ -17,6 +17,7 @@ VENV_DIR="${INSTALL_BASE_DIR}/${APP_NAME}" # Installation directory for venv and
 VENV_PATH="${VENV_DIR}/venv"
 # Use /usr/local/bin for locally installed executables/scripts
 LAUNCHER_PATH="/usr/local/bin/${LAUNCHER_NAME}"
+# Standard location for system-wide shell configuration snippets
 
 # --- Helper Functions ---
 log_info() {
@@ -57,6 +58,8 @@ fi
 log_info "Found Python script: ${SCRIPT_SOURCE_PATH}"
 
 # --- Installation Steps ---
+
+# Install/Update Gentoo system dependencies (emerge)
 log_info "Ensuring required Gentoo packages are installed/updated using emerge..."
 log_info "This step requires user confirmation ('--ask'). Dependencies: dev-python/pyqt6, app-portage/gentoolkit, app-portage/eix, sys-auth/polkit"
 # Use --update --deep --newuse (-uDN) to avoid reinstalling packages already installed and up-to-date
@@ -96,7 +99,7 @@ log_info "Installing pip dependencies (ansi2html) into the virtual environment..
 "${VENV_PATH}/bin/python" -m pip install --upgrade pip || log_warning "Failed to upgrade pip in venv. Continuing..."
 # Install required packages
 # Note: PyQt6 should ideally be handled by emerge on Gentoo (done in step 4)
-"${VENV_PATH}/bin/python" -m pip install ansi2html PyQt6 || log_error "Failed to install pip dependencies (ansi2html) in venv."
+"${VENV_PATH}/bin/python" -m pip install ansi2html || log_error "Failed to install pip dependencies (ansi2html) in venv."
 log_info "Pip dependencies installed within the virtual environment."
 
 # Create the launcher script in /usr/local/bin
@@ -136,13 +139,6 @@ chmod 755 "${LAUNCHER_PATH}" || log_error "Failed to make launcher script execut
 chown root:root "${LAUNCHER_PATH}"
 log_info "Launcher script created and set as executable: ${LAUNCHER_PATH}"
 
-chmod 644 "${ALIAS_FILE}" # Make it readable by all users
-chown root:root "${ALIAS_FILE}"
-log_info "Aliases 'portagegui' and 'pgui' defined in ${ALIAS_FILE}."
-log_warning "IMPORTANT: For the new aliases to work, you must either:"
-log_warning "  a) Log out and log back in."
-log_warning "  b) Manually source the file in your current shell: source ${ALIAS_FILE}"
-
 # --- Final Steps ---
 log_info ""
 log_info "-----------------------------------------------------"
@@ -153,7 +149,6 @@ log_info " - Virtual environment setup at: ${VENV_PATH}"
 log_info " - App script installed at: ${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
 log_info " - Pip dependencies (ansi2html) installed in venv."
 log_info " - Launcher installed at: ${LAUNCHER_PATH}"
-log_info " - Aliases ('portagegui', 'pgui') created in: ${ALIAS_FILE}"
 log_info ""
 log_info "To run the application, you can now use the command:"
 log_info "   ${LAUNCHER_NAME}"
