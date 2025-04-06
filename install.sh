@@ -140,6 +140,7 @@ chown root:root "${LAUNCHER_PATH}"
 log_info "Launcher script created and set as executable: ${LAUNCHER_PATH}"
 
 # Add .desktop
+chmod +x ./PortageGUI.desktop
 cp ./PortageGUI.desktop /usr/share/applications/
 
 # --- Final Steps ---
