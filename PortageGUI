@@ -15,35 +15,24 @@ from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QTimer, QRunnable, QThreadPool
 )
 from PyQt6.QtGui import QPalette, QColor, QIcon, QTextCursor # Import QIcon, QTextCursor
-
-# --- External Library for ANSI -> HTML ---
 try:
     from ansi2html import Ansi2HTMLConverter
 except ImportError:
     print("Warning: 'ansi2html' library not found. Output coloring disabled. Install with: pip install ansi2html")
     Ansi2HTMLConverter = None # type: ignore
-
-# --- Configuration ---
-COMMAND_TIMEOUT = 300  # Timeout for subprocess calls in seconds (e.g., 5 minutes)
-REFRESH_INTERVAL = 300000 # Refresh disk space every 5 minutes (in milliseconds)
-# Set application icon path (replace with your actual icon path or remove if none)
+COMMAND_TIMEOUT = 300
+REFRESH_INTERVAL = 300000
 APP_ICON_PATH = "/usr/share/icons/hicolor/48x48/apps/system-software-install.png" # Example path
-
-# --- Constants ---
 ACTION_INSTALL = "install"
 ACTION_UNINSTALL = "uninstall"
 ACTION_UPDATE = "update"
-
-# --- Worker Signals ---
 class WorkerSignals(QObject):
-    finished = pyqtSignal()            # Signal emitted when the worker is done (regardless of success/error)
-    error = pyqtSignal(str, str)       # Signal emitted on error (command_str, error_message)
-    result = pyqtSignal(object)        # Signal emitted with the result (e.g., command output)
-    progress = pyqtSignal(str)         # Signal for text updates (lines of output)
-    progress_val = pyqtSignal(int, int) # For progress bar (current, total) - difficult with emerge
-    status_update = pyqtSignal(str)    # For updating status bar message from worker
-
-# --- Base Worker Class for Commands ---
+    finished = pyqtSignal()
+    error = pyqtSignal(str, str)
+    result = pyqtSignal(object)
+    progress = pyqtSignal(str)
+    progress_val = pyqtSignal(int, int)
+    status_update = pyqtSignal(str)
 class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
     def __init__(self, command_list, use_pkexec=False, collect_output=False):
         super().__init__()
@@ -53,22 +42,18 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
         self.collect_output = collect_output
         self.process = None
         self.is_cancelled = False
-
     def run(self):
         command_str = ' '.join(self.command_list)
         full_command = self.command_list
         collected_stdout = []
-
         try:
             if self.use_pkexec:
-                # Check if pkexec exists before trying to use it
                 if subprocess.run(['which', 'pkexec'], capture_output=True, text=True).returncode != 0:
                     self.signals.error.emit(command_str, "Error: 'pkexec' command not found. Is PolicyKit installed?")
                     self.signals.finished.emit()
                     return
                 full_command = ['pkexec', '--disable-internal-agent'] + self.command_list
                 command_str = 'pkexec ' + command_str # Update for error reporting
-
             self.signals.status_update.emit(f"Running: {' '.join(full_command)}...") # More informative status
             self.process = subprocess.Popen(
                 full_command,
@@ -79,8 +64,6 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
                 errors='replace', # Handle potential decoding errors
                 preexec_fn=os.setsid # Create process group for easier killing
             )
-
-            # Stream stdout for progress
             if self.process.stdout:
                 for line in iter(self.process.stdout.readline, ''):
                     if self.is_cancelled:
@@ -90,20 +73,13 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
                     if self.collect_output:
                         collected_stdout.append(line_strip) # Store if needed
                 self.process.stdout.close()
-
             if self.is_cancelled:
-                # Cancellation signal emitted by stop() method
-                # self.signals.error.emit(command_str, "Operation Cancelled") # Handled in stop
                 self.signals.finished.emit()
                 return # Don't proceed further if cancelled
-
-            # Wait for the process to finish and get stderr
             stderr_output = ""
             if self.process.stderr:
                 stderr_output = self.process.stderr.read()
                 self.process.stderr.close()
-
-            # Use poll() first, then wait() with timeout only if necessary
             return_code = self.process.poll()
             if return_code is None:
                 try:
@@ -121,33 +97,26 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
                     self.signals.error.emit(command_str, f"Command timed out after {COMMAND_TIMEOUT} seconds.")
                     self.signals.finished.emit()
                     return
-            # else: return_code is already set
-
             if return_code != 0:
                 error_message = f"Command failed with exit code {return_code}.\n"
                 error_message += f"Command: {' '.join(full_command)}\n"
                 if stderr_output:
                     error_message += f"Stderr:\n{stderr_output.strip()}"
                 else:
-                    # Check stdout if stderr is empty
                     stdout_for_error = "\n".join(collected_stdout[-10:]) # Last 10 lines might help
                     if stdout_for_error:
                         error_message += f"\nLast Output Lines:\n{stdout_for_error}"
                     else:
                         error_message += "Check console output for details (no specific stderr)."
-
-                # Try to extract common emerge errors
                 if "emerge --sync" in command_str:
                     if "are you root?" in stderr_output.lower() or "permission denied" in stderr_output.lower():
                         error_message += "\n\nHint: Sync requires root privileges. Check pkexec configuration or run command manually."
                 self.signals.error.emit(command_str, error_message)
             else:
-                # Send collected output if requested, otherwise just signal success
                 if self.collect_output:
                     self.signals.result.emit("\n".join(collected_stdout))
                 else:
                     self.signals.result.emit("Command finished successfully.") # Send generic success
-
         except FileNotFoundError:
             self.signals.error.emit(command_str, f"Error: Command '{self.command_list[0]}' not found. Is it installed and in PATH?")
         except subprocess.TimeoutExpired: # Should be caught above, but as fallback
@@ -157,14 +126,11 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
             self.signals.error.emit(command_str, f"An unexpected error occurred in worker: {e}\nCommand: {' '.join(full_command)}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit() # Always emit finished
-
     def stop(self):
-        """Attempts to terminate the running process and its group."""
         self.is_cancelled = True
         if self.process and self.process.poll() is None: # Check if process is running
             self.signals.status_update.emit("Attempting process termination...")
             try:
-                # Use killpg with SIGTERM first, then SIGKILL
                 pgid = os.getpgid(self.process.pid)
                 os.killpg(pgid, 15) # Send SIGTERM to process group
                 try:
@@ -177,9 +143,7 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
                     self.signals.error.emit(' '.join(self.command_list), "Operation Forcefully Cancelled") # Emit error signal on cancel
             except ProcessLookupError:
                 self.signals.status_update.emit("Process already finished.")
-                # No error signal needed if already finished before stop was called
             except Exception as e:
-                # Fallback if killpg fails
                 self.signals.status_update.emit(f"Could not stop process group ({e}), trying direct kill...")
                 try:
                     self.process.kill() # SIGKILL directly to the process
@@ -188,30 +152,19 @@ class CommandWorker(QRunnable): # Use QRunnable for QThreadPool compatibility
                     self.signals.status_update.emit(f"Could not stop process: {ke}")
                     self.signals.error.emit(' '.join(self.command_list), f"Cancellation Failed: {ke}")
         else:
-             # If process was not running or already stopped, no explicit cancellation needed
              pass # Or emit a status update if desired
-
-
-# --- Main Application Window ---
 class GentooPackageManagerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Gentoo GUI Package Manager")
         self.setGeometry(100, 100, 1000, 700)
-
-        # Set App Icon
         if os.path.exists(APP_ICON_PATH):
             self.setWindowIcon(QIcon(APP_ICON_PATH))
         else:
             print(f"Warning: Application icon not found at {APP_ICON_PATH}")
-
-        # --- Thread Pool ---
         self.threadpool = QThreadPool()
-        # self.threadpool.setMaxThreadCount(2) # Limit concurrent threads if needed
         self.active_workers = 0 # Count active workers
         self.current_action_worker = None # Reference to the worker handling queue apply/sync/etc.
-
-        # --- Data storage ---
         self.installed_packages = [] # List of full "cat/pkg-ver" strings
         self.installed_packages_map = {} # Map "cat/pkg" -> "cat/pkg-ver" for easy lookup
         self.available_packages_by_cat = {} # category -> list of "cat/pkg" atoms
@@ -219,101 +172,66 @@ class GentooPackageManagerGUI(QMainWindow):
         self.pending_actions = {} # Stores packages queued for actions: "cat/pkg": ACTION_TYPE
         self._commands_to_run = [] # Internal list for sequential commands in apply_queue
         self._original_atoms_for_cleanup = [] # Internal list for queue cleanup
-
-        # --- ANSI Converter ---
         self.ansi_converter = Ansi2HTMLConverter(inline=True, dark_bg=True) if Ansi2HTMLConverter else None
-
-        # --- Setup UI ---
         self.setup_ui()
         self.apply_dark_mode()
-
-        # --- Initial Load (using threads) ---
         self.refresh_all() # Use refresh_all for initial load
-
-        # --- Setup Timer for Disk Space Refresh ---
         self.disk_space_timer = QTimer(self)
         self.disk_space_timer.timeout.connect(self.refresh_disk_space)
         self.disk_space_timer.start(REFRESH_INTERVAL)
-
     def setup_ui(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
-        # Remove default margins that might cause spacing issues (like the white line)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0) # Remove spacing between widgets in the main layout
-
-        # --- Tabs ---
         self.tabs = QTabWidget()
-        # Add spacing below the tabs if needed, otherwise rely on layout spacing
-        # self.layout.addWidget(self.tabs, 1) # Give tabs stretch factor
         self.layout.addWidget(self.tabs)
-
-
-        # Create Tabs
         self.browse_tab = QWidget()
         self.installed_tab = QWidget()
         self.queue_tab = QWidget() # Renamed from search_tab
         self.update_tab = QWidget()
         self.output_tab = QWidget() # Tab to show command output
-
         self.tabs.addTab(self.browse_tab, "Browse Packages")
         self.tabs.addTab(self.installed_tab, "Installed Packages")
         self.tabs.addTab(self.queue_tab, "Queue") # Renamed
         self.tabs.addTab(self.update_tab, "Updates")
         self.tabs.addTab(self.output_tab, "Output Console")
-
-        # --- Setup Tab Layouts ---
         self._setup_browse_tab()
         self._setup_installed_tab()
         self._setup_queue_tab() # Renamed
         self._setup_update_tab()
         self._setup_output_tab()
-
-        # --- Bottom Bar (Refresh Button, Status Bar, Progress) ---
         self.bottom_bar_widget = QWidget() # Use a widget for better styling control
         self.bottom_bar_layout = QHBoxLayout(self.bottom_bar_widget)
         self.bottom_bar_layout.setContentsMargins(5, 5, 5, 5) # Add some padding inside the bar
         self.layout.addWidget(self.bottom_bar_widget) # Add the bar widget to main layout
-
         self.refresh_button = QPushButton("Refresh Lists")
         self.refresh_button.setToolTip("Reload Installed, Updates, and Available Packages lists.")
         self.refresh_button.clicked.connect(self.refresh_all)
         self.bottom_bar_layout.addWidget(self.refresh_button)
-
         self.sync_button = QPushButton("Sync Repositories")
         self.sync_button.setToolTip("Run 'emerge --sync' (requires root privileges via pkexec).")
         self.sync_button.clicked.connect(self.run_sync)
         self.bottom_bar_layout.addWidget(self.sync_button)
-
         self.cancel_button = QPushButton("Cancel Action")
         self.cancel_button.setToolTip("Attempt to cancel the current Apply Queue or Sync operation.")
         self.cancel_button.clicked.connect(self.cancel_action_worker)
         self.cancel_button.setEnabled(False) # Disabled initially
         self.bottom_bar_layout.addWidget(self.cancel_button)
-
         self.bottom_bar_layout.addStretch(1) # Push status stuff to the right
-
         self.disk_space_label = QLabel("Disk: ?/? GB")
         self.bottom_bar_layout.addWidget(self.disk_space_label) # Add disk space to HBox
-
-        # --- Status Bar (Separate from bottom buttons) ---
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar) # Use the dedicated status bar area
-
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setRange(0, 0) # Indeterminate initially
         self.progress_bar.setVisible(False) # Hide initially
         self.progress_bar.setMaximumHeight(18) # Make progress bar less tall
         self.status_bar.addPermanentWidget(self.progress_bar, 1) # Takes stretch space
-
-        # Disk space label is now in the bottom_bar_layout
-
     def _setup_browse_tab(self):
         tab_layout = QVBoxLayout(self.browse_tab) # Main layout for the tab
-
-        # Filter Input
         filter_layout = QHBoxLayout() # Layout for filter and potentially other controls
         filter_layout.addWidget(QLabel("Filter:"))
         self.browse_filter_input = QLineEdit()
@@ -321,45 +239,32 @@ class GentooPackageManagerGUI(QMainWindow):
         self.browse_filter_input.textChanged.connect(self._filter_browse_list)
         filter_layout.addWidget(self.browse_filter_input)
         tab_layout.addLayout(filter_layout) # Add filter layout to tab layout
-
         splitter = QSplitter(Qt.Orientation.Horizontal)
         tab_layout.addWidget(splitter, 1) # Add splitter, make it take available space
-
-        # Left side: Categories Tree
         cat_widget = QWidget()
         cat_layout = QVBoxLayout(cat_widget)
         cat_layout.setContentsMargins(0,0,0,0)
-        # cat_layout.addWidget(QLabel("Categories:")) # Optional label
         self.category_tree = QTreeWidget()
         self.category_tree.setHeaderLabel("Categories")
         self.category_tree.itemSelectionChanged.connect(self.category_selected)
         cat_layout.addWidget(self.category_tree)
         splitter.addWidget(cat_widget)
-
-        # Right side: Packages List and Action Button
         right_pane_widget = QWidget()
         right_layout = QVBoxLayout(right_pane_widget)
         right_layout.setContentsMargins(0,0,0,0)
-        # right_layout.addWidget(QLabel("Packages:")) # Optional label
-
         self.browse_package_list = QListWidget()
         self.browse_package_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection) # Allow multi-select
         right_layout.addWidget(self.browse_package_list, 1) # Make list take available space
-
         browse_button_layout = QHBoxLayout()
         self.browse_add_queue_button = QPushButton("Add Selected to Install Queue")
         self.browse_add_queue_button.clicked.connect(self.add_browse_to_queue)
         browse_button_layout.addStretch(1) # Push button to the right
         browse_button_layout.addWidget(self.browse_add_queue_button)
         right_layout.addLayout(browse_button_layout)
-
         splitter.addWidget(right_pane_widget)
         splitter.setSizes([250, 750]) # Adjust initial sizes (smaller category list)
-
     def _setup_installed_tab(self):
         layout = QVBoxLayout(self.installed_tab)
-
-        # Filter Input
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(QLabel("Filter:"))
         self.installed_filter_input = QLineEdit()
@@ -367,59 +272,45 @@ class GentooPackageManagerGUI(QMainWindow):
         self.installed_filter_input.textChanged.connect(self._filter_installed_list)
         filter_layout.addWidget(self.installed_filter_input)
         layout.addLayout(filter_layout)
-
-        # Package List
         self.installed_package_list = QListWidget()
         self.installed_package_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection) # Allow multi-select
         layout.addWidget(self.installed_package_list, 1) # Take available space
-
-        # Action Button
         button_layout = QHBoxLayout()
         self.add_uninstall_queue_button = QPushButton("Add Selected to Uninstall Queue")
         self.add_uninstall_queue_button.clicked.connect(self.add_installed_to_queue)
         button_layout.addStretch(1)
         button_layout.addWidget(self.add_uninstall_queue_button)
         layout.addLayout(button_layout)
-
     def _setup_queue_tab(self): # Renamed from _setup_search_tab
         layout = QVBoxLayout(self.queue_tab)
-
         queue_label = QLabel("Pending Actions (Uncheck items to exclude from Apply):")
         layout.addWidget(queue_label)
-
         self.queue_list = QListWidget()
-        # Items will be added with checkboxes later
         layout.addWidget(self.queue_list, 1) # Take available space
-
         button_layout = QHBoxLayout()
         self.apply_queue_button = QPushButton("Apply Queued Changes")
         self.apply_queue_button.clicked.connect(self.apply_queue)
         button_layout.addWidget(self.apply_queue_button)
-
         self.clear_queue_button = QPushButton("Clear Queue")
         self.clear_queue_button.clicked.connect(self.clear_queue)
         button_layout.addWidget(self.clear_queue_button)
         button_layout.addStretch(1)
         layout.addLayout(button_layout)
-
     def _setup_update_tab(self):
         layout = QVBoxLayout(self.update_tab)
         self.update_package_list = QListWidget()
         self.update_package_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection) # Allow multi-select
         layout.addWidget(self.update_package_list, 1) # Take available space
-
         button_layout = QHBoxLayout()
         self.update_selected_queue_button = QPushButton("Add Selected to Update Queue")
         self.update_selected_queue_button.clicked.connect(self.add_updates_to_queue)
         button_layout.addWidget(self.update_selected_queue_button)
-
         self.update_all_queue_button = QPushButton("Add All Available Updates to Queue")
         self.update_all_queue_button.setToolTip("Adds all packages listed above to the update queue.")
         self.update_all_queue_button.clicked.connect(self.add_update_all_to_queue)
         button_layout.addWidget(self.update_all_queue_button)
         button_layout.addStretch(1)
         layout.addLayout(button_layout)
-
     def _setup_output_tab(self):
         layout = QVBoxLayout(self.output_tab)
         self.output_console = QTextEdit()
@@ -427,10 +318,8 @@ class GentooPackageManagerGUI(QMainWindow):
         self.output_console.setAcceptRichText(True) # Ensure rich text is accepted for HTML
         self.output_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap) # Prevent wrapping for better readability
         layout.addWidget(self.output_console)
-
     def apply_dark_mode(self):
         dark_palette = QPalette()
-        # Base Colors
         dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
         dark_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
         dark_palette.setColor(QPalette.ColorRole.Base, QColor(42, 42, 42)) # List/Edit background
@@ -441,56 +330,48 @@ class GentooPackageManagerGUI(QMainWindow):
         dark_palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
         dark_palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
         dark_palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-        # Highlight Colors
         dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218)) # Blue highlight
         dark_palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
-        # Disabled Colors
         dark_palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(127, 127, 127))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(127, 127, 127))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(127, 127, 127))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(127, 127, 127))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor(80, 80, 80))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.HighlightedText, QColor(127, 127, 127))
-
         app = QApplication.instance()
         if app:
             app.setPalette(dark_palette)
-
-            # Apply stylesheet
             app.setStyleSheet(f"""
                 QMainWindow {{ background-color: {dark_palette.color(QPalette.ColorRole.Window).name()}; }}
-                QWidget {{ color: {dark_palette.color(QPalette.ColorRole.WindowText).name()}; }} /* Default text color */
+                QWidget {{ color: {dark_palette.color(QPalette.ColorRole.WindowText).name()}; }}
                 QToolTip {{
                     color: #ffffff; background-color: #2a82da; border: 1px solid white; padding: 2px;
                 }}
                 QStatusBar {{ background-color: {dark_palette.color(QPalette.ColorRole.Window).name()}; }}
-                QStatusBar QLabel {{ color: {dark_palette.color(QPalette.ColorRole.WindowText).name()}; }} /* Ensure status bar text is white */
+                QStatusBar QLabel {{ color: {dark_palette.color(QPalette.ColorRole.WindowText).name()}; }}
                 QProgressBar {{
                     border: 1px solid grey; border-radius: 5px; text-align: center;
-                    background-color: #2A2A2A; /* Dark background for progress bar */
-                    color: white; /* Text color for indeterminate */
+                    background-color: #2A2A2A;
+                    color: white;
                 }}
                 QProgressBar::chunk {{
-                    background-color: #4287f5; /* Blue progress chunk */
-                    width: 10px; margin: 0.5px; /* Optional margin */
+                    background-color: #4287f5;
+                    width: 10px; margin: 0.5px;
                 }}
                 QTreeView, QListWidget {{
-                     background-color: {dark_palette.color(QPalette.ColorRole.Base).name()};
-                     alternate-background-color: {dark_palette.color(QPalette.ColorRole.AlternateBase).name()};
-                     border: 1px solid #444; /* Add subtle border */
+                    background-color: {dark_palette.color(QPalette.ColorRole.Base).name()};
+                    alternate-background-color: {dark_palette.color(QPalette.ColorRole.AlternateBase).name()};
+                    border: 1px solid #444;
                 }}
                 QTreeView::item:hover, QListWidget::item:hover {{
-                     background-color: QColor(60, 60, 60); /* Slightly lighter hover */
+                    background-color: QColor(60, 60, 60);
                 }}
                 QTreeView::item:selected, QListWidget::item:selected {{
-                     background-color: {dark_palette.color(QPalette.ColorRole.Highlight).name()};
-                     color: {dark_palette.color(QPalette.ColorRole.HighlightedText).name()};
+                    background-color: {dark_palette.color(QPalette.ColorRole.Highlight).name()};
+                    color: {dark_palette.color(QPalette.ColorRole.HighlightedText).name()};
                 }}
-                /* Style for items with checkboxes in the Queue */
-                QListWidget::item {{ padding: 3px; }} /* Add some padding */
-
-                QTabWidget::pane {{ /* The tab contents area */
-                    /* FIX: Changed border color from #C2C7CB (light grey) to #444 (dark grey) */
+                QListWidget::item {{ padding: 3px; }}
+                QTabWidget::pane {{
                     border-top: 2px solid #444;
                     position: absolute; top: -0.5em;
                     background-color: {dark_palette.color(QPalette.ColorRole.Window).name()};
@@ -498,22 +379,22 @@ class GentooPackageManagerGUI(QMainWindow):
                 QTabWidget::tab-bar {{ alignment: left; }}
                 QTabBar::tab {{
                     background: QColor(66, 66, 66); border: 1px solid #444;
-                    border-bottom-color: #444; /* Match pane border color */
+                    border-bottom-color: #444;
                     border-top-left-radius: 4px;
                     border-top-right-radius: 4px; min-width: 8ex; padding: 4px; margin-right: 2px; color: white;
                 }}
                 QTabBar::tab:selected, QTabBar::tab:hover {{ background: QColor(80, 80, 80); }}
                 QTabBar::tab:selected {{
-                     border-color: #9B9B9B; border-bottom-color: #444; /* Match pane border */
-                     font-weight: bold;
-                     background: QColor(53, 53, 53); /* Match window background */
+                    border-color: #9B9B9B; border-bottom-color: #444;
+                    font-weight: bold;
+                    background: QColor(53, 53, 53);
                 }}
                 QTabBar::tab:!selected {{ margin-top: 2px; }}
-                QTextEdit {{ /* Ensure console matches theme */
-                     background-color: {dark_palette.color(QPalette.ColorRole.Base).name()}; /* Match list background */
-                     color: #E0E0E0; /* Slightly off-white text */
-                     font-family: Monospace; /* Monospace font */
-                     border: 1px solid #444; /* Add subtle border */
+                QTextEdit {{
+                    background-color: {dark_palette.color(QPalette.ColorRole.Base).name()};
+                    color: #E0E0E0;
+                    font-family: Monospace;
+                    border: 1px solid #444;
                 }}
                 QLineEdit {{
                     padding: 3px;
@@ -524,7 +405,7 @@ class GentooPackageManagerGUI(QMainWindow):
                     padding: 5px;
                     border: 1px solid #666;
                     border-radius: 3px;
-                    background-color: QColor(70, 70, 70); /* Slightly lighter buttons */
+                    background-color: QColor(70, 70, 70);
                 }}
                 QPushButton:hover {{ background-color: QColor(85, 85, 85); }}
                 QPushButton:pressed {{ background-color: QColor(60, 60, 60); }}
@@ -534,45 +415,24 @@ class GentooPackageManagerGUI(QMainWindow):
                 QSplitter::handle:vertical {{ height: 5px; }}
                 QHeaderView::section {{ background-color: QColor(66, 66, 66); padding: 4px; border: 1px solid #444; }}
             """)
-
-
-    # --- Threading and Command Execution ---
-
     def start_worker(self, worker, is_action_worker=False):
-        """Starts a worker, tracks counts, and updates UI."""
         if is_action_worker:
             if self.current_action_worker:
                 self.show_error("Another critical operation (Apply Queue / Sync) is already in progress.")
                 return False # Indicate failure to start
             self.current_action_worker = worker
-
         self.threadpool.start(worker)
         self.active_workers += 1
         self._update_ui_for_busy_state()
         return True # Indicate successful start
-
     def _worker_finished(self):
-        """Decrements worker count and updates UI when ANY worker finishes."""
         self.active_workers = max(0, self.active_workers - 1) # Ensure it doesn't go negative
-        # Note: We don't check self.current_action_worker here.
-        # That's handled specifically in _action_worker_finished or _command_error
-        # when the action worker *itself* signals finished/error.
         self._update_ui_for_busy_state()
-
     def _action_worker_finished(self, operation_name, callback):
-        """
-        Handles cleanup specific to the main action worker (Apply Queue/Sync)
-        AFTER its finished signal is received. Only proceeds if the worker wasn't cancelled.
-        """
         is_cancelled = self.current_action_worker is not None and self.current_action_worker.is_cancelled
         worker_ref = self.current_action_worker # Keep reference before potentially clearing it
-
-        # Clear the reference ONLY if it's the one we tracked and it just finished
-        # This needs to happen regardless of success/error/cancel state
         self.current_action_worker = None # Worker is now done
         self._update_ui_for_busy_state() # Update button states based on cleared action worker
-
-        # Only perform success actions if NOT cancelled
         if worker_ref and not is_cancelled:
             self.status_bar.showMessage(f"{operation_name} completed successfully.", 5000)
             self.output_console.append(f"\n{'-'*20}\n{operation_name} finished successfully.")
@@ -582,102 +442,57 @@ class GentooPackageManagerGUI(QMainWindow):
                 except Exception as e:
                     self.show_error(f"Error in {operation_name} finished callback: {e}\n{traceback.format_exc()}")
         elif is_cancelled:
-             # Status message for cancellation is handled by _command_error or worker's stop()
-             self.output_console.append(f"\n{'-'*20}\n{operation_name} was cancelled.")
-             # Do NOT run the success callback if cancelled
-             pass
-
-
+            self.output_console.append(f"\n{'-'*20}\n{operation_name} was cancelled.")
+            pass
     def _command_error(self, command_str, error_msg, error_callback=None, is_action_worker=False):
-        """Handles errors from ANY worker."""
         is_cancel_message = "Operation Cancelled" in error_msg or "Operation Forcefully Cancelled" in error_msg
-
         if not is_cancel_message:
             self.show_error(f"Operation Failed:\n{error_msg}")
             self.status_bar.showMessage(f"Error: {error_msg.splitlines()[0]}", 8000)
             self.output_console.append(f"\n{'-'*20}\nERROR:\nCommand: {command_str}\n{error_msg}")
         else:
-            # Already handled in stop() signal or _action_worker_finished
-            # self.status_bar.showMessage("Operation Cancelled", 5000)
-            # self.output_console.append(f"\n{'-'*20}\nOperation Cancelled by User.")
-            pass
-
-        # If this error came from the action worker (and it wasn't a successful finish),
-        # ensure the reference is cleared. This might be redundant if _action_worker_finished
-        # runs after error, but ensures cleanup if error occurs before finish signal somehow.
+             pass
         if is_action_worker:
-             # Clear action worker reference if the error belongs to it
              if self.current_action_worker and self.current_action_worker.command_list == command_str.split(): # Basic check
-                  self.current_action_worker = None
-
+                 self.current_action_worker = None
         if error_callback:
             try:
                 error_callback(error_msg) # Execute the specific error callback
             except Exception as e:
                 self.show_error(f"Error in error callback: {e}\n{traceback.format_exc()}")
-
-        # _worker_finished signal will still fire to decrement counter.
-        # _update_ui_for_busy_state() will run again.
-
-
     def _command_progress(self, progress_text):
-        """Handles progress text updates, converting ANSI to HTML."""
         if self.ansi_converter:
-            # Convert ANSI to HTML
             html_line = self.ansi_converter.convert(progress_text, full=False)
-            # Append HTML to the text edit
             self.output_console.moveCursor(QTextCursor.MoveOperation.End)
             self.output_console.insertHtml(html_line + "<br>") # Append as HTML
         else:
             self.output_console.append(progress_text) # Fallback to plain text
-
-        # Auto-scroll to the bottom
         sb = self.output_console.verticalScrollBar()
         sb.setValue(sb.maximum())
-
     def _update_ui_for_busy_state(self):
-        """Enable/disable buttons based on worker states."""
         is_general_busy = self.active_workers > 0
         is_action_busy = self.current_action_worker is not None
-
-        # Refresh is disabled if *any* worker is active
         self.refresh_button.setEnabled(not is_general_busy)
-
-        # Sync and Apply Queue are disabled if an *action* worker is active
         self.sync_button.setEnabled(not is_action_busy)
-        # Enable Apply only if not busy AND queue has checkable items
         can_apply = not is_action_busy and self.queue_list.count() > 0 and any(
             self.queue_list.item(i).flags() & Qt.ItemFlag.ItemIsUserCheckable
             for i in range(self.queue_list.count())
         )
         self.apply_queue_button.setEnabled(can_apply)
         self.clear_queue_button.setEnabled(not is_action_busy) # Can clear queue even if list refresh is running
-
-        # Cancel button enabled only if an action worker is running
         self.cancel_button.setEnabled(is_action_busy)
-
-        # Queue manipulation buttons disabled if action worker is busy
         can_modify_queue = not is_action_busy
         self.browse_add_queue_button.setEnabled(can_modify_queue)
         self.add_uninstall_queue_button.setEnabled(can_modify_queue)
         self.update_selected_queue_button.setEnabled(can_modify_queue)
         self.update_all_queue_button.setEnabled(can_modify_queue)
-
-        # Progress bar visibility
         if is_general_busy and not self.progress_bar.isVisible():
             self.progress_bar.setRange(0,0) # Indeterminate
             self.progress_bar.setVisible(True)
         elif not is_general_busy and self.progress_bar.isVisible():
             self.progress_bar.setVisible(False)
             self.status_bar.clearMessage() # Clear "Running..." message when idle
-
-
     def run_action_command(self, command_list, on_success_callback=None, on_error_callback=None, use_pkexec=False, operation_name="Operation"):
-        """
-        Runs a command that typically requires privileged access and manages the
-        `current_action_worker` for cancellation (Sync, Apply Queue).
-        Returns True if started, False if another action was already running.
-        """
         command_str = ' '.join(command_list)
         self.status_bar.showMessage(f"Starting: {operation_name}...")
         self.progress_bar.setRange(0, 0) # Indeterminate
@@ -687,155 +502,87 @@ class GentooPackageManagerGUI(QMainWindow):
         self.output_console.append(f"--- Executing ({operation_name}) ---")
         self.output_console.append(f"{'pkexec ' if use_pkexec else ''}{command_str}")
         self.output_console.append(f"{'-'*len(command_str)}\n")
-
-
         worker = CommandWorker(command_list, use_pkexec, collect_output=False) # No collected output needed usually
-
-        # Connect signals - pass is_action_worker=True to error/finished handlers
-        # Generic success message handled by _action_worker_finished
         worker.signals.result.connect(lambda res: None)
-        # Error handler needs to know it's an action worker to potentially clear the reference
         worker.signals.error.connect(lambda cmd, err: self._command_error(cmd, err, on_error_callback, is_action_worker=True))
         worker.signals.progress.connect(self._command_progress)
         worker.signals.status_update.connect(self.status_bar.showMessage) # Allow worker to update status
         worker.signals.finished.connect(self._worker_finished) # Generic decrement counter ALWAYS
-        # Action-specific cleanup/callback (runs AFTER finished signal)
         worker.signals.finished.connect(lambda: self._action_worker_finished(operation_name, on_success_callback))
-
-        # Try to start the worker, marking it as an action worker
         if not self.start_worker(worker, is_action_worker=True):
-            # Failed to start (likely another action running)
             self.progress_bar.setVisible(self.active_workers > 0) # Re-evaluate progress bar
-            # Status bar message already set by start_worker's error message
             return False # Indicate failure
         return True # Indicate success
-
     def cancel_action_worker(self):
-        """Attempts to cancel the currently running action worker (Apply Queue/Sync)."""
         if self.current_action_worker:
             self.status_bar.showMessage("Attempting to cancel operation...")
             self.cancel_button.setEnabled(False) # Disable immediately to prevent multi-clicks
-            # The stop() method now emits the appropriate error/status signals
             self.current_action_worker.stop()
-            # Further UI updates (status message, button re-enabling) are handled by
-            # the worker's finished/error signals (_action_worker_finished, _command_error).
         else:
             self.status_bar.showMessage("No cancellable operation running.", 3000)
-
-
     def get_selected_items_text(self, list_widget):
-        """Helper to get the text of selected items from a QListWidget."""
         items = list_widget.selectedItems()
         return [item.text() for item in items]
-
-    # --- Filtering ---
     def _filter_list_widget(self, filter_text, list_widget, source_data=None):
-        """
-        Generic function to filter items in a QListWidget by hiding/showing.
-        If source_data is provided, it's used for matching (not implemented here).
-        Currently iterates through existing items.
-        """
         filter_lower = filter_text.lower()
         list_widget.setUpdatesEnabled(False) # Pause updates for performance
         try:
-            # Iterate by index is safer when modifying visibility
             for i in range(list_widget.count()):
                 item = list_widget.item(i)
                 if item:
                     item_text = item.text().lower()
-                    # Very simple substring matching
                     item.setHidden(filter_lower not in item_text)
         finally:
             list_widget.setUpdatesEnabled(True) # Re-enable updates
-
     def _filter_browse_list(self, text):
-        """
-        Filters the browse package list.
-        If a category is selected, filters items within that category.
-        If NO category is selected, filters across ALL available packages.
-        """
         filter_lower = text.lower()
         selected_category_items = self.category_tree.selectedItems()
-
         self.browse_package_list.setUpdatesEnabled(False)
         try:
             if not selected_category_items:
-                # --- CHANGE: Filter ALL packages if no category selected ---
                 self.browse_package_list.clear() # Clear the list first
                 matching_packages = []
                 if not filter_lower:
-                    # If filter is empty, show nothing (or maybe first N packages?)
-                    # Showing nothing prevents potentially huge list population.
                     pass
-                    # Alternative: Show all? (Potentially very slow)
-                    # for cat, pkgs in self.available_packages_by_cat.items():
-                    #     matching_packages.extend(pkgs)
                 else:
-                    # Iterate through the data source (all categories)
                     for category, packages in self.available_packages_by_cat.items():
                         for pkg_atom in packages: # pkg_atom is "cat/pkg"
                             if filter_lower in pkg_atom.lower():
                                 matching_packages.append(pkg_atom)
-                # Sort results before adding
                 self.browse_package_list.addItems(sorted(matching_packages))
             else:
-                # --- Original Logic: Filter within selected category ---
                 category = selected_category_items[0].text(0)
                 if category in self.available_packages_by_cat:
-                    # The list *should* only contain items from this category (populated by category_selected)
-                    # We just need to hide/show them based on the filter text
                     for i in range(self.browse_package_list.count()):
                         item = self.browse_package_list.item(i)
                         if item:
-                            # Item text is "cat/pkg"
                             item.setHidden(filter_lower not in item.text().lower())
-                # else: category not found? Should not happen if tree is populated correctly.
-
         finally:
             self.browse_package_list.setUpdatesEnabled(True)
-
-
     def _filter_installed_list(self, text):
-        """Filters the installed package list."""
-        # Use the generic hide/show filter function
         self._filter_list_widget(text, self.installed_package_list)
-
-
-    # --- Queue Management ---
-
     def _add_to_queue(self, package_atom, action_type):
-        """Adds or updates a package action in the queue data."""
         if not package_atom: return False
-
-        # Simple conflict resolution: last action specified wins
-        # Example: Add to install, then add to uninstall -> only uninstall remains
         self.pending_actions[package_atom] = action_type
         print(f"Queued: {package_atom} for {action_type}") # Debugging
         self._update_queue_display() # Refresh the visual list
         return True
-
     def _remove_from_queue(self, package_atom):
-        """Removes a package from the queue data."""
         if package_atom in self.pending_actions:
             del self.pending_actions[package_atom]
             print(f"Removed from queue: {package_atom}") # Debugging
             self._update_queue_display() # Refresh the visual list
             return True
         return False
-
     def _update_queue_display(self):
-        """Updates the QListWidget in the Queue tab based on self.pending_actions."""
         self.queue_list.setUpdatesEnabled(False)
         self.queue_list.clear()
         if not self.pending_actions:
             item = QListWidgetItem("Queue is empty.")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable) # Not checkable
             self.queue_list.addItem(item)
-            # self.apply_queue_button.setEnabled(False) # Handled by _update_ui_for_busy_state
         else:
-            # Sort items for display (by package name)
             sorted_atoms = sorted(self.pending_actions.keys())
-
             action_map = {
                 ACTION_INSTALL: "Install",
                 ACTION_UNINSTALL: "Uninstall",
@@ -846,42 +593,31 @@ class GentooPackageManagerGUI(QMainWindow):
                 ACTION_UNINSTALL: QColor("salmon"),
                 ACTION_UPDATE: QColor("lightgreen")
             }
-
-
             for atom in sorted_atoms:
                 action = self.pending_actions[atom]
                 action_text = action_map.get(action, "Unknown Action")
                 display_text = f"[{action_text}] {atom}"
-
                 item = QListWidgetItem(display_text)
                 item.setData(Qt.ItemDataRole.UserRole, (atom, action)) # Store atom and action
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked) # Default to checked
-                # item.setForeground(color_map.get(action, Qt.GlobalColor.white)) # Set text color based on action
                 self.queue_list.addItem(item)
-
         self.queue_list.setUpdatesEnabled(True)
         self._update_ui_for_busy_state() # Re-evaluate apply button state
-
-
     def add_browse_to_queue(self):
-        """Adds selected packages from Browse tab to install queue."""
         selected_items = self.get_selected_items_text(self.browse_package_list)
         added_count = 0
         skipped_installed = 0
         parsed_count = 0
         for item_text in selected_items:
-            # Item text should be "cat/pkg"
             atom_match = re.match(r'^([\w-]+(?:/[\w-]+)*/[\w.+-]+)$', item_text)
             if atom_match:
                 parsed_count += 1
                 atom = atom_match.group(1)
-                # Optional: Check if already installed - prevent queuing install if installed
                 if atom in self.installed_packages_map:
                     print(f"Skipping install queue for already installed package: {atom}")
                     skipped_installed += 1
                     continue # Skip adding to install queue if present in installed map
-
                 if self._add_to_queue(atom, ACTION_INSTALL):
                     added_count += 1
         if added_count > 0:
@@ -895,17 +631,13 @@ class GentooPackageManagerGUI(QMainWindow):
         elif parsed_count > 0 :
              self.show_error("Failed to add selected packages to queue.")
         elif selected_items:
-            self.show_error("Could not parse selected package names.")
+             self.show_error("Could not parse selected package names.")
         else:
-            self.status_bar.showMessage("No packages selected in the list.", 3000) # Less intrusive than error box
-
-
+             self.status_bar.showMessage("No packages selected in the list.", 3000) # Less intrusive than error box
     def add_installed_to_queue(self):
-        """Adds selected packages from Installed tab to uninstall queue."""
         selected_items = self.get_selected_items_text(self.installed_package_list)
         added_count = 0
         parsed_count = 0
-        # Pattern to extract cat/pkg from cat/pkg-ver
         pattern = re.compile(r'^([\w-]+(?:/[\w-]+)*/[\w.+-]+)-[\d].*')
         for item_text in selected_items:
             match = pattern.match(item_text)
@@ -916,31 +648,25 @@ class GentooPackageManagerGUI(QMainWindow):
                     added_count += 1
             else:
                 print(f"Warning: Could not parse atom from installed package: {item_text}")
-
         if added_count > 0:
             self.status_bar.showMessage(f"Added {added_count} package(s) to uninstall queue.", 3000)
             self.tabs.setCurrentWidget(self.queue_tab)
         elif parsed_count > 0 :
-             self.show_error("Failed to add selected packages to queue.")
+            self.show_error("Failed to add selected packages to queue.")
         elif selected_items:
             self.show_error("Could not parse selected package names for uninstallation.")
         else:
             self.status_bar.showMessage("No packages selected in the list.", 3000)
-
-
     def add_updates_to_queue(self):
-        """Adds selected packages from Updates tab to update queue."""
         selected_items = self.update_package_list.selectedItems() # Get items, not just text
         added_count = 0
         parsed_count = 0
-        # Extract package atom stored in item data
         for item in selected_items:
             atom = item.data(Qt.ItemDataRole.UserRole) # Atom was stored here
             if atom:
                 parsed_count += 1
                 if self._add_to_queue(atom, ACTION_UPDATE):
                     added_count += 1
-
         if added_count > 0:
             self.status_bar.showMessage(f"Added {added_count} package(s) to update queue.", 3000)
             self.tabs.setCurrentWidget(self.queue_tab)
@@ -950,33 +676,23 @@ class GentooPackageManagerGUI(QMainWindow):
             self.show_error("Could not get package names from selection.")
         else:
             self.status_bar.showMessage("No updates selected in the list.", 3000)
-
-
     def add_update_all_to_queue(self):
-        """Adds all available updates (from the update list) to the update queue."""
         if not self.update_list:
-            # Check if list widget has the "No updates" message
             if self.update_package_list.count() == 1 and self.update_package_list.item(0).data(Qt.ItemDataRole.UserRole) is None:
                 self.status_bar.showMessage("No updates available to add.", 3000)
             else:
                 self.show_error("No updates found or list not refreshed.")
             return
-
         added_count = 0
-        # Use self.update_list which contains only the cat/pkg atoms
         for atom in self.update_list:
             if self._add_to_queue(atom, ACTION_UPDATE):
                 added_count += 1
-
         if added_count > 0:
             self.status_bar.showMessage(f"Added all {added_count} available updates to queue.", 3000)
             self.tabs.setCurrentWidget(self.queue_tab)
         else:
             self.show_error("Failed to add updates to queue.")
-
-
     def clear_queue(self):
-        """Clears all pending actions."""
         if self.pending_actions:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Confirm Clear Queue")
@@ -990,26 +706,20 @@ class GentooPackageManagerGUI(QMainWindow):
                 self.status_bar.showMessage("Queue cleared.", 3000)
         else:
             self.status_bar.showMessage("Queue is already empty.", 3000)
-
     def apply_queue(self):
-        """Applies the checked actions in the queue."""
         actions_to_apply = defaultdict(list) # Group by action type
         atoms_in_current_apply = [] # Keep track of atoms being processed in this run
-
         for i in range(self.queue_list.count()):
             item = self.queue_list.item(i)
-            # Ensure item is checkable and checked
             if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable and item.checkState() == Qt.CheckState.Checked:
                 data = item.data(Qt.ItemDataRole.UserRole)
                 if data:
                     atom, action_type = data
                     actions_to_apply[action_type].append(atom)
                     atoms_in_current_apply.append(atom) # Track atom for cleanup on success
-
         if not actions_to_apply:
             self.show_error("No actions checked in the queue to apply.")
             return
-
         summary = []
         if actions_to_apply[ACTION_INSTALL]:
             summary.append(f"Install: {len(actions_to_apply[ACTION_INSTALL])} package(s)")
@@ -1017,58 +727,32 @@ class GentooPackageManagerGUI(QMainWindow):
             summary.append(f"Update: {len(actions_to_apply[ACTION_UPDATE])} package(s)")
         if actions_to_apply[ACTION_UNINSTALL]:
             summary.append(f"Uninstall: {len(actions_to_apply[ACTION_UNINSTALL])} package(s)")
-
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Apply Changes")
         msg_box.setText("The following actions will be performed for CHECKED items:\n\n" + "\n".join(summary) + "\n\nThis requires root privileges (via pkexec). Continue?")
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setDefaultButton(QMessageBox.StandardButton.No)
-
         if msg_box.exec() == QMessageBox.StandardButton.Yes:
-            # --- Prepare commands ---
-            # Run install/update together, then uninstall separately.
             install_update_list = actions_to_apply[ACTION_INSTALL] + actions_to_apply[ACTION_UPDATE]
             uninstall_list = actions_to_apply[ACTION_UNINSTALL]
-
             commands = []
             if install_update_list:
-                # Use --ask=n to avoid interactive prompts
-                # Use -uND (update, newuse, deep) - should be safe for install too
-                # Use --verbose for more output
                 cmd = ['emerge', '--ask=n', '--verbose', '-uND'] + install_update_list
                 commands.append({'cmd': cmd, 'op': 'Install/Update'})
-
             if uninstall_list:
-                # Use --ask=n and --verbose
-                # Use --unmerge (or -C / --depclean later?) --unmerge is more direct for queue items.
                 cmd = ['emerge', '--ask=n', '--verbose', '--unmerge'] + uninstall_list
                 commands.append({'cmd': cmd, 'op': 'Uninstall'})
-
-            # Store atoms that are part of this operation for cleanup on *full* success
             self._original_atoms_for_cleanup = list(atoms_in_current_apply) # Make a copy
             self._commands_to_run = list(commands) # Make a copy
-
-            # Start the first command in the sequence
             self._run_next_queued_command()
-
-
     def _run_next_queued_command(self):
-        """Runs the next command in the sequence from the apply queue."""
         if not self._commands_to_run:
-            # All commands completed successfully
             self._queue_apply_finished()
-            # The _action_worker_finished callback associated with the *last* command
-            # will handle the final status message.
             return
-
         command_info = self._commands_to_run.pop(0) # Get and remove first command
         cmd = command_info['cmd']
         op_name = command_info['op']
-
-        # Run this command using run_action_command
-        # On success, it calls _run_next_queued_command again via its success callback
-        # On error, it calls _queue_apply_failed via its error callback
         success = self.run_action_command(
             cmd,
             on_success_callback=self._run_next_queued_command, # Chain to next command on success
@@ -1077,53 +761,23 @@ class GentooPackageManagerGUI(QMainWindow):
             operation_name=f"Apply Queue ({op_name})"
         )
         if not success:
-            # Could not start (e.g., another action running - should not happen here normally)
-            # The error message is shown by run_action_command
-            # Need to stop the sequence.
             self._queue_apply_failed("Failed to start worker for queue sequence.")
-            # Put the command back? No, sequence failed.
             self._commands_to_run.insert(0, command_info) # Put it back just in case? Probably better to clear.
             self._commands_to_run = [] # Clear remaining commands
-
-
     def _queue_apply_finished(self):
-        """Called only when ALL commands in the queue sequence finish successfully."""
-        # The final status message is handled by the _action_worker_finished callback of the last command.
-        # self.status_bar.showMessage("All queued actions applied successfully. Refreshing lists...", 5000)
-
-        # Clean up applied items from the main pending_actions dict
         for atom in self._original_atoms_for_cleanup:
             if atom in self.pending_actions:
                 del self.pending_actions[atom]
         self._update_queue_display() # Update the visual queue
-
-        # Refresh relevant lists after changes
         self.refresh_installed_packages()
         self.refresh_updates()
-
-        # Clear internal state variables used for the sequence
         self._commands_to_run = []
         self._original_atoms_for_cleanup = []
-
-
     def _queue_apply_failed(self, error_msg):
-        """Called if any command in the queue sequence fails."""
-        # Error message is displayed by _command_error handler
-        # self.show_error(f"Queue application failed: {error_msg}")
         self.status_bar.showMessage("Queue application failed. See Output Console.", 6000)
-
-        # Do not remove items from the pending_actions queue automatically on failure. User can retry or clear.
-
-        # Clear the remaining commands to run and cleanup list
         self._commands_to_run = []
         self._original_atoms_for_cleanup = []
-        # UI state (buttons enabled/disabled) is handled by _command_error -> _action_worker_finished -> _update_ui_for_busy_state
-
-
-    # --- Specific Actions (Sync, Refresh) ---
-
     def run_sync(self):
-        """Runs 'emerge --sync' via the action command runner."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Sync")
         msg_box.setText("This will synchronize the package repositories using 'emerge --sync'.\nThis may take some time and requires root privileges (via pkexec).\n\nContinue?")
@@ -1134,294 +788,184 @@ class GentooPackageManagerGUI(QMainWindow):
             self.run_action_command( # Use the action command runner
                 ['emerge', '--sync'],
                 on_success_callback=self._sync_finished, # Specific callback on success
-                # on_error_callback is handled generically by run_action_command
                 use_pkexec=True,
                 operation_name="Repository Sync"
             )
-
     def _sync_finished(self):
-        """Called only on successful completion of sync."""
-        # Status message handled by _action_worker_finished
-        # self.status_bar.showMessage("Sync finished successfully. Refreshing updates list...", 4000)
         self.refresh_updates() # Refresh updates list after successful sync
-
     def refresh_all(self):
-        """Refreshes all data lists using background threads."""
         if self.active_workers > 0 and self.current_action_worker:
-            # Allow refresh if only non-action workers are running, but not if sync/apply is active
             self.show_error("Cannot refresh while a critical operation (Apply Queue / Sync) is in progress.")
             return
-
         self.status_bar.showMessage("Refreshing all data lists...")
-        # Clear existing views immediately for feedback (except queue)
         self.installed_package_list.setUpdatesEnabled(False)
         self.update_package_list.setUpdatesEnabled(False)
         self.category_tree.setUpdatesEnabled(False)
         self.browse_package_list.setUpdatesEnabled(False)
-
         self.installed_package_list.clear()
         self.update_package_list.clear()
         self.category_tree.clear()
         self.browse_package_list.clear()
         self.installed_filter_input.clear() # Clear filters
         self.browse_filter_input.clear()
-
         self.installed_package_list.addItem("Loading installed packages...")
         self.update_package_list.addItem("Checking for updates...")
         self.category_tree.addTopLevelItem(QTreeWidgetItem(["Loading categories..."]))
         self.browse_package_list.addItem("Select a category or use filter...")
-
         self.installed_package_list.setUpdatesEnabled(True)
         self.update_package_list.setUpdatesEnabled(True)
         self.category_tree.setUpdatesEnabled(True)
         self.browse_package_list.setUpdatesEnabled(True)
-
-
-        # Reset data structures before refresh
         self.installed_packages = []
         self.installed_packages_map = {}
-        # self.available_packages_by_cat = {} # Keep available packages cached unless explicitly refreshed?
-                                             # Let's reload it for consistency on full refresh.
         self.available_packages_by_cat = {}
         self.update_list = []
-
-
-        # Trigger all refresh actions, they will run in threads via start_worker
-        # These are not "action workers" so multiple can run, and cancel isn't available for them.
         self.refresh_installed_packages()
         self.refresh_updates()
         self.load_all_available_packages() # This loads categories too
         self.refresh_disk_space() # This one is usually fast, run directly
-
-    # --- Data Loading Functions ---
-
     def load_all_available_packages(self):
-        """Loads categories and all available packages using equery in a thread."""
         self.status_bar.showMessage("Loading available packages list (equery list */*)...")
-        # Don't clear tree here, clear happens in refresh_all or handler
-        # Using equery list can be slow, consider alternatives if needed.
         worker = CommandWorker(['equery', 'list', '*/*'], collect_output=True)
         worker.signals.result.connect(self._handle_available_packages_result)
         worker.signals.error.connect(lambda cmd, err: self._command_error(cmd, err, self._handle_available_packages_error)) # Specific error handler
         worker.signals.finished.connect(self._worker_finished) # Generic finish handler
         self.start_worker(worker) # Not an action worker
-
     def _handle_available_packages_result(self, output_str):
-        """Parses the output of 'equery list */*' and populates the category tree."""
         try:
             local_available_packages = defaultdict(set) # Use set for efficient adding
             lines = output_str.strip().splitlines()
-            # More specific pattern: cat/pkg-ver. We only need cat/pkg.
-            # Example: sys-apps/portage-3.0.62
-            # Example: app-editors/vim-9.1.0
-            # Example: dev-vcs/git-2.44.0
             package_pattern = re.compile(r'^\s*([\w-]+(?:/[\w-]+)*)/([\w.+-]+)-([\d].*)') # cat/subcat/pkg-ver
-
             for line in lines:
-                # Skip header/footer lines from equery
                 if '[ Searching ... ]' in line or '[ Completed ' in line: continue
-                # Skip lines that don't look like package entries
                 if not '/' in line or '-' not in line: continue
-
                 match = package_pattern.match(line.strip())
                 if match:
                     category = match.group(1)
                     package_name = match.group(2)
                     full_atom = f"{category}/{package_name}" # Store cat/pkg atom
-
                     local_available_packages[category].add(full_atom)
-
-            # --- Update main data and Populate Tree AFTER parsing all ---
-            # Convert sets to sorted lists
             self.available_packages_by_cat = {
                 cat: sorted(list(pkgs)) for cat, pkgs in local_available_packages.items()
             }
-
             self.category_tree.setUpdatesEnabled(False)
             self.category_tree.clear() # Clear "Loading..." item
             sorted_categories = sorted(self.available_packages_by_cat.keys())
             top_level_items = [QTreeWidgetItem([category]) for category in sorted_categories]
             self.category_tree.addTopLevelItems(top_level_items)
-            # self.category_tree.sortItems(0, Qt.SortOrder.AscendingOrder) # Already sorted
             self.category_tree.setUpdatesEnabled(True)
             self.category_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-
-
-            # Clear the browse list (which might show "Select category...")
             self.browse_package_list.clear()
             self.browse_filter_input.clear() # Ensure filter is clear
-
             self.status_bar.showMessage(f"Loaded {sum(len(pkgs) for pkgs in self.available_packages_by_cat.values())} available packages in {len(sorted_categories)} categories.", 5000)
-
         except Exception as e:
             self.show_error(f"Error parsing available packages list: {e}\n{traceback.format_exc()}")
             self._handle_available_packages_error("Parsing failed.")
-
     def _handle_available_packages_error(self, error_msg):
-        """Handle errors during available package loading."""
         self.status_bar.showMessage("Error loading available packages list.", 5000)
         self.category_tree.clear()
         self.category_tree.addTopLevelItem(QTreeWidgetItem(["Error loading categories"]))
         self.browse_package_list.clear()
         self.browse_package_list.addItem("Error loading packages.")
-
-
     def category_selected(self):
-        """Populates the browse list when a category selection changes."""
         selected_items = self.category_tree.selectedItems()
         self.browse_package_list.setUpdatesEnabled(False)
         self.browse_package_list.clear()
-        # self.browse_filter_input.clear() # Clear filter when category changes? Maybe keep filter active? Let's keep it.
         self.browse_filter_input.setPlaceholderText("Filter packages in selected category...")
-
-
         if not selected_items:
-             # No category selected - list remains empty until filter is used
              self.browse_filter_input.setPlaceholderText("Filter packages (leave category tree empty to search all)...")
-             # Apply current filter text (if any) across all categories
              self._filter_browse_list(self.browse_filter_input.text())
-
         else:
             category_item = selected_items[0]
             category = category_item.text(0)
-
             if category in self.available_packages_by_cat:
                 packages = self.available_packages_by_cat[category] # Already sorted list of cat/pkg
                 self.browse_package_list.addItems(packages)
-                # Apply filter to the newly populated list
                 self._filter_browse_list(self.browse_filter_input.text())
             else:
                  self.browse_package_list.addItem(f"No packages found for category '{category}'.") # Should not happen often
-
         self.browse_package_list.setUpdatesEnabled(True)
-
-
     def refresh_installed_packages(self):
-        """Refreshes the installed packages list using equery in a thread."""
         self.status_bar.showMessage("Loading installed packages list (equery list -I)...")
-        # Use equery list --installed or -I for installed packages
         worker = CommandWorker(['equery', 'list', '--installed', '*/*'], collect_output=True)
         worker.signals.result.connect(self._handle_installed_packages_result)
         worker.signals.error.connect(lambda cmd, err: self._command_error(cmd, err, self._handle_installed_packages_error))
         worker.signals.finished.connect(self._worker_finished)
         self.start_worker(worker) # Not an action worker
-
     def _handle_installed_packages_result(self, output_str):
-        """Parses 'equery list --installed' output and updates the list widget."""
         try:
             lines = output_str.strip().splitlines()
-            # Pattern: cat/pkg-ver
             package_pattern = re.compile(r'^([\w-]+(?:/[\w-]+)*)/([\w.+-]+-[\d].*)') # cat/pkg-ver
-            # Pattern to extract atom: cat/pkg
             atom_pattern = re.compile(r'^([\w-]+(?:/[\w-]+)*)/([\w.+-]+)-[\d].*')
-
             local_installed_packages = []
             local_installed_map = {}
-
             for line in lines:
                  if '[ Searching ... ]' in line or '[ Completed ' in line: continue
                  match = package_pattern.match(line.strip())
                  if match:
                      full_ver_pkg = match.group(0).strip() # Full line match cat/pkg-ver
                      local_installed_packages.append(full_ver_pkg)
-
-                     # Extract atom (cat/pkg) for the map
                      atom_match = atom_pattern.match(full_ver_pkg)
                      if atom_match:
                          atom = f"{atom_match.group(1)}/{atom_match.group(2)}"
                          local_installed_map[atom] = full_ver_pkg # Map cat/pkg to cat/pkg-ver
-
             self.installed_packages = sorted(local_installed_packages)
             self.installed_packages_map = local_installed_map
-
             self.installed_package_list.setUpdatesEnabled(False)
             self.installed_package_list.clear() # Clear "Loading..."
             self.installed_package_list.addItems(self.installed_packages)
             self.installed_package_list.setUpdatesEnabled(True)
-
             self._filter_installed_list(self.installed_filter_input.text()) # Reapply filter
             self.status_bar.showMessage(f"{len(self.installed_packages)} installed packages loaded.", 5000)
         except Exception as e:
             self.show_error(f"Error parsing installed packages list: {e}\n{traceback.format_exc()}")
             self._handle_installed_packages_error("Parsing failed.")
-
     def _handle_installed_packages_error(self, error_msg):
-        """Handle errors during installed package loading."""
         self.status_bar.showMessage("Error loading installed packages list.", 5000)
         self.installed_package_list.clear()
         self.installed_package_list.addItem("Error loading installed packages.")
-
-
     def refresh_updates(self):
-        """Checks for updates using 'emerge -upvND @world' in a thread."""
         self.status_bar.showMessage("Checking for updates (emerge -upvND @world)...")
         command = ['emerge', '--pretend', '--update', '--verbose', '--newuse', '--deep', '@world']
-        # command = ['emerge', '-upvND', '@world'] # Equivalent shorthand
         worker = CommandWorker(command, collect_output=True) # Collect output to parse
         worker.signals.result.connect(self._handle_updates_result)
-        # Allow non-zero exit code if it's just 'no updates found' - check stderr? Emerge usually exits 0.
         worker.signals.error.connect(lambda cmd, err: self._command_error(cmd, err, self._handle_updates_error)) # Handles non-zero exit etc.
         worker.signals.finished.connect(self._worker_finished)
         self.start_worker(worker) # Not an action worker
-
     def _handle_updates_result(self, output_str):
-        """Parses 'emerge -upvND' output and populates the updates list."""
         try:
             local_update_list_atoms = set() # Use set to store unique cat/pkg atoms
             display_items_map = {} # Store display text keyed by atom
-
             lines = output_str.strip().splitlines()
-            # Regex needs to be robust for various emerge output formats
-            # Example: [ebuild U ] app-arch/xz-utils-5.4.6 -> 5.6.1 [5.4.6] USE="nls threads -extra-checks -static-libs" 0 KiB
-            # Example: [ebuild N ] dev-libs/libunistring-1.1 USE="doc -static-libs" 0 KiB
-            # Example: [ebuild R ] dev-python/PyQt6-6.7.0 [6.6.2] USE="dbus designer gui multimedia opengl printsupport QML widgets (-aqua) -debug -gles2-only -opengl-desktop -pax_kernel -test -webchannel -webengine" 0 KiB
             update_pattern = re.compile(
                 r"\[ebuild\s+(?P<type>[DUNR])(?P<block>[DS]?)\s*]\s+" # Type (Update, New, Downgrade, Rebuild), Block status
                 r"(?P<catpkg>[\w-]+(?:/[\w-]+)*/[\w.+-]+)-"          # Category/Package atom (ends before version)
                 r"(?P<version>[\d].*?)"                              # Version string (captured lazily)
                 r"(?:\s+->\s*(?P<newver>[\d].*?))?"                  # Optional '-> newver' for updates/downgrades
-                r"(?:.+USE=\"(?P<use>.*?)\")?"                      # Optional USE flags section (non-greedy match before)
-                # Add optional repo/size info capture if needed later
-                # r".*?\s+(?P<repo>\S+/\S+)?\s+(?P<size>\d+\s+\w+)"
+                r"(?:.+USE=\"(?P<use>.*?)\")?"                       # Optional USE flags section (non-greedy match before)
             )
-
             for line in lines:
-                # Skip summary lines etc.
                 if not line.strip().startswith('[ebuild'): continue
-
                 match = update_pattern.search(line)
                 if match:
                     data = match.groupdict()
                     pkg_atom = data['catpkg'] # Actionable item is cat/pkg atom
-
-                    # Store the atom
                     local_update_list_atoms.add(pkg_atom)
-
-                    # --- Build display text (use the most complete line found for an atom) ---
                     status = data['type']
                     status_desc = {'U': 'Update', 'N': 'New', 'D': 'Downgrade', 'R': 'Rebuild'}.get(status, status)
                     current_version = data['version'] # Version being acted upon
                     new_version = data['newver']
-
                     display_text = f"{pkg_atom}"
                     if new_version: # Update or Downgrade
-                         # Try to find the *currently* installed version for comparison if possible
-                         installed_ver = self.installed_packages_map.get(pkg_atom, f"{current_version} (?)") # Use parsed version as fallback
-                         if installed_ver.startswith(pkg_atom): installed_ver = installed_ver[len(pkg_atom)+1:] # Strip cat/pkg- prefix
-                         display_text += f" ({installed_ver} -> {new_version})"
+                        installed_ver = self.installed_packages_map.get(pkg_atom, f"{current_version} (?)") # Use parsed version as fallback
+                        if installed_ver.startswith(pkg_atom): installed_ver = installed_ver[len(pkg_atom)+1:] # Strip cat/pkg- prefix
+                        display_text += f" ({installed_ver} -> {new_version})"
                     else: # New or Rebuild
-                         # If rebuild, show current version; if new, show the version being installed
-                         display_text += f" ({status_desc} {current_version})"
-
+                        display_text += f" ({status_desc} {current_version})"
                     if data['use']:
                         display_text += f" | USE: {data['use'].strip()}"
-
-                    # Store the best display text found for this atom
                     display_items_map[pkg_atom] = display_text
-
-
             self.update_list = sorted(list(local_update_list_atoms)) # Update main data (sorted atoms)
-
             self.update_package_list.setUpdatesEnabled(False)
             self.update_package_list.clear() # Clear "Loading..." or old items
             if not self.update_list:
@@ -1432,43 +976,29 @@ class GentooPackageManagerGUI(QMainWindow):
                 self.update_package_list.addItem(no_item)
             else:
                 self.status_bar.showMessage(f"{len(self.update_list)} updates available.", 5000)
-                # Create list items using the display map, sorted by atom
                 for atom in self.update_list: # Iterate through sorted atoms
                     display_text = display_items_map.get(atom, f"{atom} (Update info missing)")
                     item = QListWidgetItem(display_text)
                     item.setData(Qt.ItemDataRole.UserRole, atom) # Store atom for later use
                     self.update_package_list.addItem(item)
-
             self.update_package_list.setUpdatesEnabled(True)
-
         except Exception as e:
             self.show_error(f"Error parsing update check results: {e}\n{traceback.format_exc()}")
             self._handle_updates_error("Parsing failed.")
-
     def _handle_updates_error(self, error_msg):
-        """Handle errors during update check."""
-        # Check if error is just emerge needing sync
         if "emerge --sync" in error_msg:
              self.status_bar.showMessage("Repository sync needed. Run 'Sync Repositories'.", 8000)
              self.update_package_list.clear()
              self.update_package_list.addItem("Run 'Sync Repositories' before checking updates.")
         else:
-            self.status_bar.showMessage("Error checking updates.", 5000)
-            self.update_package_list.clear()
-            self.update_package_list.addItem("Error checking updates. See Output Console.")
-
-
-    # --- Disk Space ---
+             self.status_bar.showMessage("Error checking updates.", 5000)
+             self.update_package_list.clear()
+             self.update_package_list.addItem("Error checking updates. See Output Console.")
     def refresh_disk_space(self):
-        """Refreshes the disk space label (runs in main thread, usually fast)."""
         try:
-            # Get stats for root filesystem '/'
             stats = os.statvfs('/')
-            # Calculate sizes in bytes
             total_bytes = stats.f_blocks * stats.f_frsize
-            # Available for non-root users
             available_bytes = stats.f_bavail * stats.f_frsize
-            # Convert to GB
             total_gb = total_bytes / (1024**3)
             available_gb = available_bytes / (1024**3)
             used_gb = total_gb - available_gb
@@ -1477,32 +1007,22 @@ class GentooPackageManagerGUI(QMainWindow):
         except Exception as e:
             self.disk_space_label.setText("Disk: Error")
             print(f"Error getting disk space: {e}") # Log error
-
-
-    # --- Utility Functions ---
     def show_error(self, message):
-        """Shows a critical error message box."""
-        # Ensure this runs in the main thread if called from a worker (using signals is preferred)
         QMessageBox.critical(self, "Error", message)
-
     def closeEvent(self, event):
-        """Handles the window close event, ensuring critical workers are handled."""
         if self.current_action_worker: # Check if a Sync or Apply Queue is running
             reply = QMessageBox.question(self, 'Confirm Exit',
                                          "A critical operation (Apply Queue / Sync) is in progress.\n\nAre you sure you want to exit? The operation will be cancelled.",
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
-
             if reply == QMessageBox.StandardButton.Yes:
                 self.status_bar.showMessage("Exiting: Cancelling running operation...")
                 self.cancel_action_worker() # Attempt cancellation
-                # Don't wait explicitly for cancellation to finish, just allow close
                 self.threadpool.waitForDone(1000) # Brief wait for signals maybe?
                 event.accept()
             else:
                 event.ignore() # Prevent closing
                 return # Don't proceed to check other workers
-
         elif self.active_workers > 0: # Check for non-action workers (list refreshes)
             reply = QMessageBox.question(self, 'Confirm Exit',
                                          f"{self.active_workers} background list refresh task(s) are still running.\n\nExit anyway?",
@@ -1513,32 +1033,22 @@ class GentooPackageManagerGUI(QMainWindow):
                 return
             else:
                 print(f"Exiting with {self.active_workers} background tasks still active.")
-                # We don't have explicit cancellation for list workers, just exit.
-                # Try to wait briefly for threads to finish naturally if possible.
                 self.threadpool.waitForDone(1000) # Wait max 1 sec
                 event.accept()
         else: # No workers running
             event.accept()
-
-
-# --- Main Execution ---
 if __name__ == "__main__":
     if os.geteuid() == 0:
-        # Use ANSI escape codes for color if terminal supports it
         print("\033[91mWarning:\033[0m Running this GUI directly as root is not recommended.")
         print("Please run as a regular user. Operations requiring privileges will use pkexec.")
         try:
-            # Use input() which works in both Python 2 and 3 for simple cases
             reply = input("Continue anyway as root? (y/N): ")
         except NameError: # Fallback for very old Python 2 where input() evals
              reply = raw_input("Continue anyway as root? (y/N): ") # type: ignore
-
         if reply.lower() != 'y':
             sys.exit("Exiting: Please run as a non-root user.")
-
     if not Ansi2HTMLConverter:
         print("\n\033[93m*** WARNING: 'ansi2html' not found. Install with 'pip install ansi2html' for colored console output in the GUI. ***\033[0m\n")
-
     app = QApplication(sys.argv)
     main_window = GentooPackageManagerGUI()
     main_window.show()
