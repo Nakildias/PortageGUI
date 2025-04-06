@@ -1,0 +1,19 @@
+[Desktop Entry]
+Version=1.1
+Type=Application
+Name=Portage GUI
+GenericName=Portage Frontend
+Comment=A graphical interface for managing Gentoo packages with Portage
+# Execute the launcher script created by the installation
+Exec=/usr/local/bin/PortageGUI
+# Set Terminal=false because it's a graphical application
+Terminal=false
+# Icon: Replace 'system-software-install' with a specific icon name/path
+# if you have one (e.g., /opt/PortageGUI/icon.png or a name from your theme)
+Icon=system-software-install
+# Categories help place the app in the correct menu section
+Categories=System;PackageManager;Qt;
+# Keywords help find the application via search in menus
+Keywords=portage;gentoo;package;manager;emerge;update;install;gui;equery;eix;
+# Enable startup notification (shows loading cursor, etc.)
+StartupNotify=true
