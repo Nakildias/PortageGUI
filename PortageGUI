@@ -3,7 +3,6 @@ import os
 import subprocess
 import re
 import math
-import html
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QListWidget, QPushButton, QLineEdit, QLabel,
@@ -13,7 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QTimer, QRegularExpression
 )
-from PyQt6.QtGui import QPalette, QColor, QIcon, QTextCursor, QFont, QTextCharFormat, QBrush # Import more QtGui
+from PyQt6.QtGui import QPalette, QColor, QIcon, QTextCursor # Import QIcon, QTextCursor
 
 # --- Configuration ---
 COMMAND_TIMEOUT = 300  # Timeout for subprocess calls in seconds (e.g., 5 minutes)
@@ -21,24 +20,35 @@ REFRESH_INTERVAL = 300000 # Refresh disk space every 5 minutes (in milliseconds)
 # Set application icon path (replace with your actual icon path or remove if none)
 APP_ICON_PATH = "/usr/share/icons/hicolor/48x48/apps/system-software-install.png" # Example path
 
+# --- ANSI Color Conversion ---
+try:
+    from ansi2html import Ansi2HTMLConverter
+    conv = Ansi2HTMLConverter(dark_bg=True, scheme='solarized')
+    ANSI_ENABLED = True
+except ImportError:
+    ANSI_ENABLED = False
+    print("Warning: 'ansi2html' library not found. Output console will not display colors.")
+    print("Install it using: pip install ansi2html")
+    # Basic fallback for stripping ANSI codes if library is missing
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
 # --- Worker Signals ---
 class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
-    result = pyqtSignal(object) # Can emit complex objects like lists/dicts
+    result = pyqtSignal(object) # Can emit lists, strings, etc.
     progress = pyqtSignal(str) # For text updates
+    progress_val = pyqtSignal(int, int) # For progress bar (current, total)
 
-# --- Worker Base Class ---
+# --- Worker Base Class (For Commands potentially needing pkexec) ---
 class CommandWorker(QThread):
-    """ Worker thread for running external commands """
-    def __init__(self, command_list, use_pkexec=False, return_stdout=False):
+    def __init__(self, command_list, use_pkexec=False):
         super().__init__()
         self.command_list = command_list
         self.signals = WorkerSignals()
         self.use_pkexec = use_pkexec
-        self.return_stdout = return_stdout # If True, emit stdout via result signal
         self.process = None
-        self._raw_stdout_lines = []
+        self._running = True
 
     def run(self):
         try:
@@ -48,7 +58,7 @@ class CommandWorker(QThread):
                 if subprocess.run(['which', 'pkexec'], capture_output=True, text=True).returncode != 0:
                     self.signals.error.emit("Error: 'pkexec' command not found. Is PolicyKit installed?")
                     return
-                full_command = ['pkexec', '--disable-internal-agent'] + self.command_list
+                full_command = ['pkexec', '--disable-internal-agent'] + self.command_list # Use external agent for password prompt
 
             self.process = subprocess.Popen(
                 full_command,
@@ -59,16 +69,17 @@ class CommandWorker(QThread):
                 errors='replace' # Handle potential decoding errors
             )
 
-            self._raw_stdout_lines = [] # Reset stdout buffer
-
-            # Stream stdout for progress and potentially capture it
+            # Stream stdout for progress
             if self.process.stdout:
                 for line in iter(self.process.stdout.readline, ''):
-                    line_strip = line.strip()
-                    self.signals.progress.emit(line_strip)
-                    if self.return_stdout:
-                        self._raw_stdout_lines.append(line_strip) # Append line, not raw line with newline
+                    if not self._running:
+                        break
+                    self.signals.progress.emit(line.strip())
                 self.process.stdout.close()
+
+            if not self._running:
+                 self.signals.error.emit("Operation Cancelled")
+                 return
 
             # Wait for the process to finish and get stderr
             stderr_output = ""
@@ -76,32 +87,18 @@ class CommandWorker(QThread):
                 stderr_output = self.process.stderr.read()
                 self.process.stderr.close()
 
-            return_code = self.process.wait(timeout=COMMAND_TIMEOUT) # Wait with timeout
+            self.process.wait(timeout=COMMAND_TIMEOUT) # Wait with timeout
 
-            if return_code != 0:
-                error_message = f"Command failed with exit code {return_code}.\n"
+            if self.process.returncode != 0:
+                error_message = f"Command failed with exit code {self.process.returncode}.\n"
                 error_message += f"Command: {' '.join(full_command)}\n"
                 if stderr_output:
                     error_message += f"Stderr:\n{stderr_output.strip()}"
                 else:
-                    # Sometimes emerge errors go to stdout when pkexec is used
                     error_message += "Check console output for details."
-
-                # Try to extract common emerge errors (basic example)
-                combined_output_for_error_check = stderr_output + "".join(self._raw_stdout_lines)
-                if "emerge --sync" in " ".join(self.command_list):
-                     if "are you root?" in combined_output_for_error_check.lower():
-                         error_message += "\n\nHint: Sync requires root privileges. Check pkexec configuration."
-                     elif "Permission denied" in combined_output_for_error_check:
-                         error_message += "\n\nHint: Permission denied. Check pkexec configuration or filesystem permissions."
-
                 self.signals.error.emit(error_message)
             else:
-                # Emit result if needed, otherwise just finished
-                if self.return_stdout:
-                    self.signals.result.emit(self._raw_stdout_lines)
-                else:
-                    self.signals.result.emit("Command finished successfully.") # Or specific result
+                self.signals.result.emit("Command finished successfully.") # Or specific result
                 self.signals.finished.emit()
 
         except FileNotFoundError:
@@ -109,55 +106,118 @@ class CommandWorker(QThread):
         except subprocess.TimeoutExpired:
             if self.process:
                 self.process.kill()
-            self.signals.error.emit(f"Command timed out after {COMMAND_TIMEOUT} seconds.\nCommand: {' '.join(self.command_list)}") # Use original list
+            self.signals.error.emit(f"Command timed out after {COMMAND_TIMEOUT} seconds.\nCommand: {' '.join(full_command)}")
         except Exception as e:
-            self.signals.error.emit(f"An unexpected error occurred: {e}\nCommand: {' '.join(self.command_list)}") # Use original list
-        # No finally needed for finished signal, handled within try/except logic
+            self.signals.error.emit(f"An unexpected error occurred in CommandWorker: {e}\nCommand: {' '.join(full_command)}")
+        finally:
+            self._running = False
+            # No need to explicitly emit finished if error occurred, signal handles it
 
     def stop(self):
+        self._running = False
         if self.process and self.process.poll() is None: # Check if process is running
             try:
-                self.signals.progress.emit("Attempting to cancel operation...")
-                # Ask pkexec/sudo parent to terminate the child first if possible
-                # This might not always work depending on pkexec/polkit version
+                # Ask pkexec/sudo to terminate the child first (more gentle)
+                # Use pkill cautiously, ensure it targets only the child
+                # Finding the direct child PID can be tricky with pkexec
+                # For now, try terminating the Popen process directly.
+                # If pkexec is used, this might only kill pkexec itself.
+                self.signals.progress.emit("Attempting to terminate process...")
+                self.process.terminate()
                 try:
-                    parent_pid = self.process.pid
-                    # Find the actual emerge/equery process started by pkexec
-                    # This is complex and potentially unreliable. pgrep might help.
-                    # Example using pgrep (requires pgrep installed):
-                    # pgrep_cmd = ['pgrep', '-P', str(parent_pid)]
-                    # pgrep_proc = subprocess.run(pgrep_cmd, capture_output=True, text=True)
-                    # if pgrep_proc.returncode == 0:
-                    #     child_pids = pgrep_proc.stdout.strip().split()
-                    #     for pid in child_pids:
-                    #         subprocess.run(['pkexec', 'kill', pid], check=True) # Try killing child via pkexec
-                    # else:
-                    #     # Fallback: Terminate the pkexec process itself
-                    #      self.process.terminate()
-
-                    # Simpler approach: just terminate pkexec/the direct process
-                    self.process.terminate()
-
-                except FileNotFoundError:
-                    self.process.terminate() # Fallback if pgrep/pkexec kill fails
-                except Exception:
-                    self.process.terminate() # General fallback
-
-                try:
-                    self.process.wait(timeout=3) # Wait a bit
+                    self.process.wait(timeout=2) # Wait a bit
                 except subprocess.TimeoutExpired:
+                    self.signals.progress.emit("Forcing process kill...")
                     self.process.kill() # Force kill if necessary
-                self.signals.progress.emit("Operation cancelled by user.")
-                self.signals.error.emit("Operation Cancelled") # Use error signal to stop progress bar etc.
+                self.signals.progress.emit("Termination signal sent.")
+                # Error signal will be emitted by run() method if cancellation is detected
             except Exception as e:
-                # If killing fails, try force kill anyway
-                try:
-                     if self.process and self.process.poll() is None:
-                         self.process.kill()
-                except Exception as kill_e:
-                     self.signals.progress.emit(f"Could not stop process cleanly, kill attempt error: {kill_e}")
-                self.signals.error.emit(f"Could not stop process gracefully: {e}")
+                self.signals.progress.emit(f"Could not stop process cleanly: {e}")
 
+
+# --- Generic Worker for Data Fetching (No pkexec needed) ---
+class GenericWorker(QThread):
+    def __init__(self, command_list, parser_func=None):
+        super().__init__()
+        self.command_list = command_list
+        self.parser_func = parser_func # Optional function to parse stdout
+        self.signals = WorkerSignals()
+        self.process = None
+        self._running = True
+
+    def run(self):
+        try:
+            self.process = subprocess.Popen(
+                self.command_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                errors='replace'
+            )
+
+            stdout_lines = []
+            if self.process.stdout:
+                 for line in iter(self.process.stdout.readline, ''):
+                    if not self._running:
+                        break
+                    # Simple progress update (optional)
+                    # self.signals.progress.emit(f"Processing: {line.strip()[:50]}...")
+                    stdout_lines.append(line.strip())
+                 self.process.stdout.close()
+
+            if not self._running:
+                self.signals.error.emit("Operation Cancelled")
+                return
+
+            stderr_output = ""
+            if self.process.stderr:
+                stderr_output = self.process.stderr.read()
+                self.process.stderr.close()
+
+            self.process.wait(timeout=COMMAND_TIMEOUT)
+
+            if self.process.returncode != 0:
+                error_message = f"Command failed with exit code {self.process.returncode}.\n"
+                error_message += f"Command: {' '.join(self.command_list)}\n"
+                if stderr_output:
+                    error_message += f"Stderr:\n{stderr_output.strip()}"
+                self.signals.error.emit(error_message)
+            else:
+                # Process the result
+                if self.parser_func:
+                    parsed_result = self.parser_func(stdout_lines)
+                    self.signals.result.emit(parsed_result)
+                else:
+                    self.signals.result.emit(stdout_lines) # Emit raw lines if no parser
+                self.signals.finished.emit()
+
+        except FileNotFoundError:
+            self.signals.error.emit(f"Error: Command '{self.command_list[0]}' not found. Is it installed and in PATH?")
+        except subprocess.TimeoutExpired:
+            if self.process:
+                self.process.kill()
+            self.signals.error.emit(f"Command timed out after {COMMAND_TIMEOUT} seconds.\nCommand: {' '.join(self.command_list)}")
+        except Exception as e:
+            self.signals.error.emit(f"An unexpected error occurred in GenericWorker: {e}\nCommand: {' '.join(self.command_list)}")
+        finally:
+             self._running = False
+
+
+    def stop(self):
+        self._running = False
+        if self.process and self.process.poll() is None:
+            try:
+                self.signals.progress.emit("Attempting to terminate process...")
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.signals.progress.emit("Forcing process kill...")
+                    self.process.kill()
+                self.signals.progress.emit("Termination signal sent.")
+            except Exception as e:
+                self.signals.progress.emit(f"Could not stop process cleanly: {e}")
 
 # --- Main Application Window ---
 class GentooPackageManagerGUI(QMainWindow):
@@ -171,44 +231,29 @@ class GentooPackageManagerGUI(QMainWindow):
             self.setWindowIcon(QIcon(APP_ICON_PATH))
 
         # --- Data storage ---
-        self.installed_packages_list = [] # Store full package strings from equery
-        self.installed_package_atoms = {} # Map full string to cat/pkg atom
-        self.available_packages_tree = {} # Store packages for browse tree {cat: [pkg, pkg,...]}
-        self.update_list_display = [] # Store display strings for updates
-        self.update_list_atoms = [] # Store cat/pkg atoms for updates
+        self.installed_packages = []
+        self.all_available_packages = [] # Full list for filtering
+        self.update_list_atoms = [] # Actionable atoms (cat/pkg)
+        self.update_list_display = [] # Formatted strings for display
         self.current_worker = None
-        self.total_available_packages = 0
-        self.total_installed_packages = 0
-        self.total_updates = 0
 
-        # ANSI Color Handling Setup
-        self.ansi_colors = {
-            # Foreground basic
-            '30': '#555555', '31': '#FF5555', '32': '#55FF55', '33': '#FFFF55',
-            '34': '#5555FF', '35': '#FF55FF', '36': '#55FFFF', '37': '#FFFFFF',
-            # Background basic
-            '40': '#555555', '41': '#AA0000', '42': '#00AA00', '43': '#AA5500',
-            '44': '#0000AA', '45': '#AA00AA', '46': '#00AAAA', '47': '#AAAAAA',
-            # Reset
-            '0': None # Indicates reset to default
+        # Store base tab texts
+        self.tab_base_texts = {
+            "browse": "Browse Packages",
+            "installed": "Installed Packages",
+            "updates": "Updates",
+            "output": "Output Console"
         }
-        self.current_format = QTextCharFormat()
-        self.default_format = QTextCharFormat() # Store default format
+
 
         # --- Setup UI ---
         self.setup_ui()
         self.apply_dark_mode()
-        # Store default format *after* applying theme
-        self.default_format = self.output_console.currentCharFormat()
-        self.current_format = self.default_format
 
-        # --- Initial Load ---
-        # Start loading in background using threads
-        self.status_bar.showMessage("Initializing: Loading package lists...")
-        self.load_all_available_packages() # Start loading available packages
-        self.refresh_installed_packages()  # Start loading installed packages
-        # Updates will be checked after available/installed are potentially loaded or manually refreshed
-
+        # --- Initial Load (using threads) ---
+        self.refresh_installed_packages()
+        self.load_all_available_packages() # Load available packages for browse tab
+        self.refresh_updates()
         self.refresh_disk_space() # Initial disk space check
 
         # --- Setup Timer for Disk Space Refresh ---
@@ -220,7 +265,7 @@ class GentooPackageManagerGUI(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
-        self.layout.setContentsMargins(5, 5, 5, 5) # Reduce margins
+        self.layout.setContentsMargins(5, 5, 5, 5) # Reduce margins slightly
         self.layout.setSpacing(5) # Reduce spacing
 
         # --- Tabs ---
@@ -230,51 +275,53 @@ class GentooPackageManagerGUI(QMainWindow):
         # Create Tabs
         self.browse_tab = QWidget()
         self.installed_tab = QWidget()
+        # self.search_tab = QWidget() # Removed
         self.update_tab = QWidget()
         self.output_tab = QWidget() # Tab to show command output
 
-        # Add tabs with placeholders for counts
-        self.browse_tab_index = self.tabs.addTab(self.browse_tab, "Browse Packages")
-        self.installed_tab_index = self.tabs.addTab(self.installed_tab, "Installed Packages")
-        self.update_tab_index = self.tabs.addTab(self.update_tab, "Updates")
-        self.output_tab_index = self.tabs.addTab(self.output_tab, "Output Console")
+        # Store tab indices for easy access later
+        self.browse_tab_index = self.tabs.addTab(self.browse_tab, self.tab_base_texts["browse"])
+        self.installed_tab_index = self.tabs.addTab(self.installed_tab, self.tab_base_texts["installed"])
+        # self.search_tab_index = self.tabs.addTab(self.search_tab, "Search") # Removed
+        self.update_tab_index = self.tabs.addTab(self.update_tab, self.tab_base_texts["updates"])
+        self.output_tab_index = self.tabs.addTab(self.output_tab, self.tab_base_texts["output"])
 
         # --- Setup Tab Layouts ---
         self._setup_browse_tab()
         self._setup_installed_tab()
+        # self._setup_search_tab() # Removed
         self._setup_update_tab()
         self._setup_output_tab()
 
         # --- Bottom Bar (Refresh Button, Status Bar, Progress) ---
         self.bottom_bar_layout = QHBoxLayout()
-        # self.layout.addLayout(self.bottom_bar_layout) # Add status bar separately
+        # self.bottom_bar_layout.setSpacing(10) # Keep some spacing here
 
-        self.refresh_button = QPushButton("Refresh All")
-        self.refresh_button.setToolTip("Reload installed packages, check for updates, and reload available packages.")
+        self.refresh_button = QPushButton("Refresh Lists")
+        self.refresh_button.setToolTip("Reload installed, available, and update package lists")
         self.refresh_button.clicked.connect(self.refresh_all)
-        # self.bottom_bar_layout.addWidget(self.refresh_button) # Add to status bar instead
+        self.bottom_bar_layout.addWidget(self.refresh_button)
 
         self.sync_button = QPushButton("Sync Repositories")
-        self.sync_button.setToolTip("Run 'emerge --sync' (requires pkexec).")
+        self.sync_button.setToolTip("Run 'emerge --sync' (requires privileges)")
         self.sync_button.clicked.connect(self.run_sync)
-        # self.bottom_bar_layout.addWidget(self.sync_button) # Add to status bar instead
+        self.bottom_bar_layout.addWidget(self.sync_button)
+
+        self.bottom_bar_layout.addStretch(1) # Add stretch before cancel
 
         self.cancel_button = QPushButton("Cancel Operation")
-        self.cancel_button.setToolTip("Attempt to stop the current background operation.")
+        self.cancel_button.setToolTip("Attempt to stop the current background operation")
         self.cancel_button.clicked.connect(self.cancel_operation)
         self.cancel_button.setEnabled(False) # Disabled initially
-        # self.bottom_bar_layout.addWidget(self.cancel_button) # Add to status bar instead
+        self.bottom_bar_layout.addWidget(self.cancel_button)
 
+        self.layout.addLayout(self.bottom_bar_layout)
+
+        # --- Status Bar ---
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        # Add buttons to the left side of the status bar
-        self.status_bar.addWidget(self.refresh_button)
-        self.status_bar.addWidget(self.sync_button)
-        self.status_bar.addWidget(self.cancel_button)
-
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(18) # Make it less tall
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setRange(0, 0) # Indeterminate initially
         self.progress_bar.setVisible(False) # Hide initially
@@ -285,60 +332,52 @@ class GentooPackageManagerGUI(QMainWindow):
 
     def _setup_browse_tab(self):
         layout = QVBoxLayout(self.browse_tab)
-        layout.setContentsMargins(0, 5, 0, 0) # Adjust margins
+        layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
-        # Search Bar
+        # Search bar for filtering
         self.browse_search_input = QLineEdit()
-        self.browse_search_input.setPlaceholderText("Search available packages...")
-        self.browse_search_input.setClearButtonEnabled(True)
-        self.browse_search_input.textChanged.connect(self.filter_browse_tree)
+        self.browse_search_input.setPlaceholderText("Filter available packages...")
+        self.browse_search_input.textChanged.connect(self.filter_browse_packages)
         layout.addWidget(self.browse_search_input)
 
-        # Package Tree (replaces Category Tree + Package List)
-        self.package_tree = QTreeWidget()
-        self.package_tree.setHeaderLabel("Available Packages (Category/Package)")
-        self.package_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
-        # self.package_tree.itemClicked.connect(self.category_selected) # Not needed now
-        self.package_tree.itemDoubleClicked.connect(self.install_selected_browse) # Double-click to install? Maybe not safe.
-        layout.addWidget(self.package_tree)
+        # List widget for all available packages
+        self.browse_package_list = QListWidget()
+        self.browse_package_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.browse_package_list)
 
-        # Install Button
+        # Install button
         self.browse_install_button = QPushButton("Install Selected")
-        self.browse_install_button.setToolTip("Install selected packages from the tree (requires pkexec).")
         self.browse_install_button.clicked.connect(self.install_selected_browse)
         layout.addWidget(self.browse_install_button)
 
     def _setup_installed_tab(self):
         layout = QVBoxLayout(self.installed_tab)
-        layout.setContentsMargins(0, 5, 0, 0)
+        layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
-        # Search Bar
+        # Search bar for filtering
         self.installed_search_input = QLineEdit()
-        self.installed_search_input.setPlaceholderText("Search installed packages...")
-        self.installed_search_input.setClearButtonEnabled(True)
-        self.installed_search_input.textChanged.connect(self.filter_installed_list)
+        self.installed_search_input.setPlaceholderText("Filter installed packages...")
+        self.installed_search_input.textChanged.connect(self.filter_installed_packages)
         layout.addWidget(self.installed_search_input)
 
-        # Installed List
-        self.installed_package_list_widget = QListWidget()
-        self.installed_package_list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        layout.addWidget(self.installed_package_list_widget)
+        # List widget for installed packages
+        self.installed_package_list = QListWidget()
+        self.installed_package_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.installed_package_list)
 
-        # Uninstall Button
-        button_layout = QHBoxLayout()
+        # Uninstall button
         self.uninstall_button = QPushButton("Uninstall Selected")
-        self.uninstall_button.setToolTip("Uninstall selected packages (uses emerge --unmerge, requires pkexec).")
         self.uninstall_button.clicked.connect(self.uninstall_selected)
-        button_layout.addWidget(self.uninstall_button)
-        # Add stretch?
-        button_layout.addStretch(1)
-        layout.addLayout(button_layout)
+        layout.addWidget(self.uninstall_button) # Add directly to layout
+
+    # def _setup_search_tab(self): -- REMOVED --
+    #     pass
 
     def _setup_update_tab(self):
         layout = QVBoxLayout(self.update_tab)
-        layout.setContentsMargins(0, 5, 0, 0)
+        layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
         self.update_package_list = QListWidget()
@@ -347,33 +386,63 @@ class GentooPackageManagerGUI(QMainWindow):
 
         button_layout = QHBoxLayout()
         self.update_selected_button = QPushButton("Update Selected")
-        self.update_selected_button.setToolTip("Install updates for the selected packages (requires pkexec).")
         self.update_selected_button.clicked.connect(self.update_selected)
         button_layout.addWidget(self.update_selected_button)
 
-        self.update_all_button = QPushButton("Update All")
-        self.update_all_button.setToolTip("Install all available updates using 'emerge -uND @world' (requires pkexec).")
+        self.update_all_button = QPushButton("Update All (@world)")
         self.update_all_button.clicked.connect(self.update_all)
         button_layout.addWidget(self.update_all_button)
-        button_layout.addStretch(1)
         layout.addLayout(button_layout)
 
     def _setup_output_tab(self):
         layout = QVBoxLayout(self.output_tab)
-        layout.setContentsMargins(0, 5, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 0) # No margins for the console itself
         self.output_console = QTextEdit()
         self.output_console.setReadOnly(True)
-        self.output_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap) # Keep NoWrap
-        # Set font for better monospace alignment if needed
-        font = QFont("monospace") # Or "Courier New", "Monaco", etc.
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        self.output_console.setFont(font)
+        self.output_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        # Set background color explicitly for console in dark mode
+        console_palette = self.output_console.palette()
+        console_palette.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30)) # Darker background
+        console_palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.lightGray) # Default text color
+        self.output_console.setPalette(console_palette)
         layout.addWidget(self.output_console)
+
+    # --- Filtering Logic ---
+    def filter_browse_packages(self):
+        filter_text = self.browse_search_input.text().strip().lower()
+        self.browse_package_list.clear()
+        # Check if the full list has been loaded
+        if hasattr(self, 'all_available_packages') and self.all_available_packages:
+            if not filter_text:
+                # If filter is empty, show all cached items
+                self.browse_package_list.addItems(self.all_available_packages)
+            else:
+                # Show only matching items
+                matching_items = [pkg for pkg in self.all_available_packages if filter_text in pkg.lower()]
+                self.browse_package_list.addItems(matching_items)
+        elif not filter_text:
+             # If filter is empty and list wasn't loaded, show nothing (or placeholder)
+             pass # Or add a "Loading..." item if appropriate
+
+    def filter_installed_packages(self):
+        filter_text = self.installed_search_input.text().strip().lower()
+        self.installed_package_list.clear()
+        # Check if the full list has been loaded
+        if hasattr(self, 'installed_packages') and self.installed_packages:
+            if not filter_text:
+                # If filter is empty, show all cached items
+                self.installed_package_list.addItems(self.installed_packages)
+            else:
+                # Show only matching items
+                matching_items = [pkg for pkg in self.installed_packages if filter_text in pkg.lower()]
+                self.installed_package_list.addItems(matching_items)
+        elif not filter_text:
+            pass # Or add a "Loading..." item
+
 
     # --- Styling ---
     def apply_dark_mode(self):
         dark_palette = QPalette()
-
         # Base Colors
         dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
         dark_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
@@ -382,289 +451,262 @@ class GentooPackageManagerGUI(QMainWindow):
         dark_palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.black)
         dark_palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
         dark_palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white) # General text
-        dark_palette.setColor(QPalette.ColorRole.Button, QColor(66, 66, 66)) # Slightly lighter buttons
+        dark_palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
         dark_palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
         dark_palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-
         # Highlight Colors
-        dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218)) # Blue highlight
         dark_palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
-
         # Disabled Colors
-        disabled_text_color = QColor(127, 127, 127)
-        dark_palette.setColor(QPalette.ColorRole.PlaceholderText, disabled_text_color)
-        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled_text_color)
-        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled_text_color)
-        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled_text_color)
+        dark_palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(127, 127, 127))
+        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(127, 127, 127))
+        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(127, 127, 127))
+        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(127, 127, 127))
         dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor(80, 80, 80))
-        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.HighlightedText, disabled_text_color)
+        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.HighlightedText, QColor(127, 127, 127))
 
         app = QApplication.instance()
         app.setPalette(dark_palette)
-        self.output_console.setPalette(dark_palette) # Ensure QTextEdit gets it too
 
-        # Optional: Apply stylesheet for more control
-        # Removed QTabWidget::pane top adjustment
-        # Added more specific progress bar styling
+        # Apply stylesheet for more control
+        # Adjusted QTabWidget::pane border
+        # Refined QProgressBar::chunk
         app.setStyleSheet("""
             QToolTip {
                 color: #ffffff;
                 background-color: #2a82da;
-                border: 1px solid #555555; /* Darker border */
-                padding: 4px; /* Add padding */
+                border: 1px solid white;
+                padding: 2px;
+            }
+            QStatusBar {
+                color: #ffffff; /* Ensure status bar text is white */
             }
             QProgressBar {
-                border: 1px solid grey;
-                border-radius: 4px; /* Slightly less rounded */
+                border: 1px solid #666666; /* Darker border */
+                border-radius: 5px;
                 text-align: center;
-                background-color: #424242; /* Match base */
-                height: 18px; /* Control height */
+                color: #ffffff; /* Text on progress bar (if visible) */
+                background-color: #424242; /* Background of the bar */
             }
             QProgressBar::chunk {
                 background-color: #4287f5; /* Blue progress chunk */
-                border-radius: 3px; /* Match parent rounding */
-                /* width: 10px; */ /* Width often doesn't work well with indeterminate */
-                 margin: 1px; /* Add small margin */
+                border-radius: 4px; /* Slightly rounded chunk */
+                margin: 1px; /* Add margin to see the background */
             }
-            QTreeView, QListWidget {
-                 border: 1px solid #444444; /* Add subtle border */
+            QListWidget, QTreeView { /* Apply base color to lists/trees */
+                 background-color: QColor(42, 42, 42);
             }
             QTreeView::item:hover, QListWidget::item:hover {
-                 background-color: QColor(70, 70, 70); /* Slightly lighter on hover */
+                background-color: QColor(60, 60, 60); /* Slightly lighter on hover */
             }
-             QTreeView::item:selected, QListWidget::item:selected {
+            QTreeView::item:selected, QListWidget::item:selected {
                  background-color: #2a82da; /* Use highlight color from palette */
                  color: white;
             }
             QTabWidget::pane { /* The tab contents area */
-                 border: 1px solid #444444;
-                 /* position: absolute; */ /* Removed */
-                 /* top: -0.5em; */ /* Removed - potential cause of white line */
+                 /* Remove the border that might cause the white line */
+                 border: none;
+                 /* Optional: Add padding if content feels too close to tab */
+                 /* padding: 5px; */
             }
             QTabWidget::tab-bar {
                  alignment: left;
             }
             /* Style the tabs */
             QTabBar::tab {
-                 background: QColor(58, 58, 58); /* Slightly lighter than base */
+                 background: QColor(66, 66, 66); /* Slightly lighter than base */
                  border: 1px solid #444;
-                 /* border-bottom-color: #C2C7CB; */ /* Match pane border */
-                 border-bottom: none; /* Remove bottom border for inactive */
+                 /* border-bottom-color: #444; /* Match border color */ */
+                 border-bottom: none; /* Remove bottom border for selected */
                  border-top-left-radius: 4px;
                  border-top-right-radius: 4px;
-                 min-width: 10ex; /* Adjust width */
-                 padding: 5px 8px; /* Adjust padding */
-                 margin-right: 2px; /* Space between tabs */
-                 color: #cccccc; /* Lighter text for inactive */
+                 min-width: 10ex; /* Increased width slightly */
+                 padding: 5px; /* Increased padding */
+                 margin-right: 1px;
+                 color: #dddddd; /* Lighter text for tabs */
             }
             QTabBar::tab:hover {
-                 background: QColor(70, 70, 70);
-                 color: #ffffff;
+                 background: QColor(80, 80, 80);
             }
             QTabBar::tab:selected {
                  background: QColor(53, 53, 53); /* Match window background */
-                 border-color: #444444;
-                 border-bottom: 1px solid #535353; /* Make selected tab blend into pane */
-                 margin-bottom: -1px; /* Pull tab down slightly */
-                 color: #ffffff; /* White text for selected */
+                 border-color: #444;
+                 /* border-bottom-color: QColor(53, 53, 53); /* Match window background to blend */ */
+                 border-bottom: none;
+                 color: #ffffff; /* White text for selected tab */
+                 /* Make selected tab slightly taller */
+                 /* padding-bottom: 6px; */
             }
-            QLineEdit {
-                 padding: 3px;
-                 border: 1px solid #444444;
+            QTabBar::tab:!selected {
+                 margin-top: 2px; /* Make non-selected tabs look smaller */
+                 background: QColor(70, 70, 70); /* Darker background for non-selected */
+                 color: #aaaaaa; /* Grayer text for non-selected */
+            }
+            QLineEdit { /* Ensure LineEdit uses Base color */
+                 background-color: QColor(42, 42, 42);
+                 padding: 2px;
+                 border: 1px solid #666666;
                  border-radius: 3px;
             }
-            QPushButton {
-                 padding: 5px 10px;
-                 border: 1px solid #555555;
-                 border-radius: 3px;
-                 background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
-                                                  stop: 0 #666666, stop: 1 #555555); /* Subtle gradient */
+            QTextEdit { /* Explicitly style QTextEdit if palette isn't enough */
+                 background-color: QColor(30, 30, 30); /* Match _setup_output_tab */
+                 color: #f0f0f0;
+                 border: 1px solid #444;
             }
-            QPushButton:hover {
-                 background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
-                                                  stop: 0 #777777, stop: 1 #666666);
-                 border-color: #777777;
-            }
-            QPushButton:pressed {
-                 background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
-                                                  stop: 0 #555555, stop: 1 #444444);
-                 border-color: #444444;
-            }
-            QPushButton:disabled {
-                 background-color: #444444; /* Flat color when disabled */
-                 border-color: #333333;
-            }
-
         """)
+
+    # --- Update Tab Text Helper ---
+    def update_tab_text(self, tab_index, base_text_key, count):
+        """Updates the text of a tab to include the count."""
+        base_text = self.tab_base_texts.get(base_text_key, "Tab")
+        if count is None: # Still loading or error
+             display_text = f"{base_text} (?)"
+        else:
+             display_text = f"{base_text} ({count})"
+        self.tabs.setTabText(tab_index, display_text)
 
     # --- Backend Interaction Functions ---
 
-    def run_command(self, command_list, on_finished=None, on_error=None, on_progress=None, on_result=None, use_pkexec=False, return_stdout=False, operation_name="Operation"):
-        """ Generic function to run commands in a background thread """
+    def run_generic_task(self, command_list, parser_func, on_finished, on_error, on_result, status_message="Running task...", progress_id=None):
+        """Runs a generic command in the background using GenericWorker."""
         if self.current_worker and self.current_worker.isRunning():
             self.show_error("Another operation is already in progress.")
             return
 
-        self.status_bar.showMessage(f"{operation_name}: Running...")
+        self.status_bar.showMessage(status_message)
         self.progress_bar.setRange(0, 0) # Indeterminate
         self.progress_bar.setVisible(True)
         self.cancel_button.setEnabled(True)
-        self.tabs.setCurrentWidget(self.output_tab) # Switch to output tab
-        self.output_console.clear() # Clear previous output
-        self._append_ansi_text(f"Executing: {'pkexec ' if use_pkexec else ''}{' '.join(command_list)}\n{'-'*40}\n")
+        # Optionally switch to output tab or keep current tab
+        # self.tabs.setCurrentWidget(self.output_tab)
+        # self.output_console.clear()
+        # self.output_console.append(f"Starting: {' '.join(command_list)}\n{'-'*20}\n")
 
-        self.current_worker = CommandWorker(command_list, use_pkexec, return_stdout)
-
-        # Setup standard connections
-        self.current_worker.signals.finished.connect(lambda: self._command_finished(operation_name, on_finished))
-        self.current_worker.signals.error.connect(lambda error_msg: self._command_error(error_msg, operation_name, on_error))
-        self.current_worker.signals.progress.connect(self._command_progress)
-
-        # Connect result if a handler is provided
-        if on_result:
-            self.current_worker.signals.result.connect(lambda result_data: self._command_result(result_data, operation_name, on_result))
-        else:
-             # Still connect finished if no specific result handler needed but command was success
-             self.current_worker.signals.result.connect(lambda result_data: print(f"{operation_name} result (not handled): {result_data}"))
-
+        self.current_worker = GenericWorker(command_list, parser_func)
+        # Use lambdas to pass the original callbacks
+        self.current_worker.signals.finished.connect(lambda: self._generic_finished(on_finished))
+        self.current_worker.signals.error.connect(lambda error_msg: self._command_error(error_msg, on_error)) # Can reuse command error handler
+        self.current_worker.signals.result.connect(on_result)
+        # self.current_worker.signals.progress.connect(self._command_progress) # Enable if worker emits progress
 
         self.current_worker.start()
 
-    def _command_finished(self, operation_name, callback):
-        self.status_bar.showMessage(f"{operation_name} completed successfully.", 5000)
+    def _generic_finished(self, callback):
+        """Called when a GenericWorker finishes successfully."""
+        self.status_bar.showMessage("Task completed.", 5000)
         self.progress_bar.setVisible(False)
         self.cancel_button.setEnabled(False)
-        if self.current_worker: # Check if worker still exists (might be None if cancelled fast)
-             self._append_ansi_text(f"\n{'-'*40}\n{operation_name} finished successfully.")
+        self.current_worker = None
+        if callback:
+            callback()
+
+    def run_emerge_command(self, command_list, on_finished, on_error, status_message="Running emerge...", use_pkexec=True):
+        """Runs an emerge command potentially requiring privileges."""
+        if self.current_worker and self.current_worker.isRunning():
+            self.show_error("Another operation is already in progress.")
+            return
+
+        self.status_bar.showMessage(status_message)
+        self.progress_bar.setRange(0, 0) # Indeterminate
+        self.progress_bar.setVisible(True)
+        self.cancel_button.setEnabled(True)
+        self.tabs.setCurrentWidget(self.output_tab) # Switch to output tab for emerge
+        self.output_console.clear()
+        self.output_console.append(f"Executing: {'pkexec ' if use_pkexec else ''}{' '.join(command_list)}\n{'-'*20}\n")
+
+        self.current_worker = CommandWorker(command_list, use_pkexec)
+        self.current_worker.signals.finished.connect(lambda: self._command_finished(on_finished))
+        self.current_worker.signals.error.connect(lambda error_msg: self._command_error(error_msg, on_error))
+        self.current_worker.signals.progress.connect(self._command_progress)
+        # self.current_worker.signals.result.connect(on_result_if_needed) # Usually not needed for emerge actions
+
+        self.current_worker.start()
+
+    def _command_finished(self, callback):
+        """Generic handler for successful command completion."""
+        self.status_bar.showMessage("Operation completed successfully.", 5000)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setEnabled(False)
+        if self.current_worker: # Check if worker still exists (might be None if finished very fast)
+             # Check if cursor is already at the end before appending
+             cursor = self.output_console.textCursor()
+             cursor.movePosition(QTextCursor.MoveOperation.End)
+             at_end = cursor.atEnd()
+             self.output_console.append(f"\n{'-'*20}\nOperation finished successfully.")
+             if at_end: # Auto-scroll only if user hasn't scrolled up
+                 self.output_console.ensureCursorVisible() # Scrolls down
         self.current_worker = None
         if callback:
             callback() # Execute the success callback
 
-    def _command_error(self, error_msg, operation_name, callback):
-        self.status_bar.showMessage(f"{operation_name} failed: {error_msg.splitlines()[0]}", 5000)
+    def _command_error(self, error_msg, callback):
+        """Generic handler for command errors."""
+        # Check if it's just a cancellation message
+        if "Operation Cancelled" in error_msg:
+             self.status_bar.showMessage("Operation Cancelled.", 5000)
+             if self.current_worker: # May already be None
+                 self.output_console.append(f"\n{'-'*20}\nOperation Cancelled by User.")
+                 self.output_console.ensureCursorVisible()
+        else:
+            self.status_bar.showMessage(f"Operation failed: {error_msg.splitlines()[0]}", 6000)
+            if self.current_worker:
+                self.output_console.append(f"\n{'-'*20}\nERROR:\n{error_msg}")
+                self.output_console.ensureCursorVisible()
+            self.show_error(f"Operation Failed:\n{error_msg}")
+
         self.progress_bar.setVisible(False)
         self.cancel_button.setEnabled(False)
-        if self.current_worker: # Append error only if worker exists
-             self._append_ansi_text(f"\n{'-'*40}\n\033[1;31mERROR:\033[0m\n{error_msg}") # Use ANSI red for error message
-        # Show modal dialog only for non-cancellation errors
-        if error_msg != "Operation Cancelled":
-             self.show_error(f"{operation_name} Failed:\n{error_msg}")
-        self.current_worker = None
-        if callback:
-            callback(error_msg) # Execute the error callback (passing error)
+        self.current_worker = None # Ensure worker is cleared
+        if callback and "Operation Cancelled" not in error_msg:
+            callback(error_msg) # Execute the error callback only for actual errors
+
 
     def _command_progress(self, progress_text):
-        # Append progress text to the output console using ANSI handler
-        self._append_ansi_text(progress_text + "\n") # Add newline for readability
-        # No status bar updates here, too noisy
+        """Handles progress updates from workers."""
+        if ANSI_ENABLED:
+            # Convert ANSI codes to HTML and append
+            html_output = conv.convert(progress_text, full=False) # full=False avoids HTML boilerplate
+            # Append HTML - moves cursor automatically
+            self.output_console.moveCursor(QTextCursor.MoveOperation.End)
+            self.output_console.insertHtml(html_output + "<br>") # Add line break
+            self.output_console.ensureCursorVisible() # Auto-scroll
+        elif ansi_escape: # Fallback: strip ANSI codes
+            cleaned_text = ansi_escape.sub('', progress_text)
+            self.output_console.append(cleaned_text) # Append plain text
+            self.output_console.ensureCursorVisible() # Auto-scroll
+        else: # Should not happen if ansi_escape is defined
+             self.output_console.append(progress_text)
+             self.output_console.ensureCursorVisible()
 
-    def _command_result(self, result_data, operation_name, callback):
-        """Handles the raw result emitted by the worker"""
-        # This is called *before* _command_finished if result is emitted on success
-        # print(f"DEBUG: Received result for {operation_name}") # Debugging line
-        if callback:
-            callback(result_data) # Pass the result data to the specific handler
-
-    # --- ANSI Color Handling for Output Console ---
-    def _append_ansi_text(self, text):
-        """ Appends text containing ANSI escape codes to the QTextEdit, interpreting colors. """
-        cursor = self.output_console.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-
-        # Basic ANSI parsing (ESC[...m)
-        ansi_pattern = re.compile(r'\x1B\[([0-9;]*)m')
-        last_end = 0
-
-        for match in ansi_pattern.finditer(text):
-            start, end = match.span()
-            # Append text before the ANSI code with current format
-            if start > last_end:
-                cursor.insertText(text[last_end:start], self.current_format)
-
-            codes = match.group(1).split(';')
-            if not codes or codes == ['']: codes = ['0'] # Handle ESC[m same as ESC[0m
-
-            for code in codes:
-                if code == '0': # Reset all attributes
-                    self.current_format = self.default_format
-                elif code == '1': # Bold
-                    self.current_format.setFontWeight(QFont.Weight.Bold)
-                elif code == '22': # Normal intensity (reset bold)
-                     self.current_format.setFontWeight(QFont.Weight.Normal)
-                elif code in self.ansi_colors: # Basic fg/bg colors
-                    color_hex = self.ansi_colors[code]
-                    if color_hex:
-                        color = QColor(color_hex)
-                        if '30' <= code <= '37': # Foreground
-                            self.current_format.setForeground(QBrush(color))
-                        elif '40' <= code <= '47': # Background
-                            self.current_format.setBackground(QBrush(color))
-                # Add more codes here if needed (underline, italic, specific colors)
-
-            last_end = end
-
-        # Append remaining text after the last ANSI code
-        if last_end < len(text):
-            cursor.insertText(text[last_end:], self.current_format)
-
-        # Ensure console scrolls to the bottom
-        self.output_console.setTextCursor(cursor)
-        self.output_console.verticalScrollBar().setValue(self.output_console.verticalScrollBar().maximum())
-
-    # --- UI Filtering ---
-
-    def filter_browse_tree(self, text):
-        """ Filters the package_tree based on the search input """
-        filter_text = text.lower().strip()
-
-        iterator = QTreeWidgetItemIterator(self.package_tree)
-        while iterator.value():
-            item = iterator.value()
-            # Check both category (parent) and package (child) items
-            item_text = item.text(0).lower()
-            parent = item.parent()
-            parent_text = parent.text(0).lower() if parent else ""
-
-            # Logic: Show item if it matches OR its parent matches OR its child matches
-            matches = filter_text in item_text or (parent and filter_text in parent_text)
-
-            # If it's a category, check if any children match
-            if item.childCount() > 0 and not matches:
-                 for i in range(item.childCount()):
-                     child = item.child(i)
-                     if filter_text in child.text(0).lower():
-                         matches = True
-                         break
-
-            # Set hidden state based on match result
-            # Also ensure parent categories are visible if a child matches
-            item.setHidden(not matches)
-            if matches and parent:
-                 parent.setHidden(False) # Ensure parent is visible
-
-            iterator += 1
-
-        # Expand items if filter is active? Optional.
-        # if filter_text:
-        #     self.package_tree.expandAll()
-        # else:
-        #     self.package_tree.collapseAll()
+        # Simple status update (optional)
+        # self.status_bar.showMessage(f"Processing: {progress_text[:80]}...")
 
 
-    def filter_installed_list(self, text):
-        """ Filters the installed_package_list_widget based on search input """
-        filter_text = text.lower().strip()
-        for i in range(self.installed_package_list_widget.count()):
-            item = self.installed_package_list_widget.item(i)
-            item.setHidden(filter_text not in item.text().lower())
+    def cancel_operation(self):
+        if self.current_worker and self.current_worker.isRunning():
+            self.status_bar.showMessage("Attempting to cancel operation...")
+            self.current_worker.stop()
+            # GUI updates (disabling cancel button, hiding progress bar) will be handled
+            # by the _command_error or _generic_finished slots when the worker stops.
+            self.cancel_button.setEnabled(False) # Disable immediately to prevent multiple clicks
+        else:
+            self.status_bar.showMessage("No operation running to cancel.", 3000)
 
-    # --- Package Count Updates ---
-    def update_tab_titles(self):
-        """ Updates tab titles with current package counts. """
-        self.tabs.setTabText(self.browse_tab_index, f"Browse Packages ({self.total_available_packages})")
-        self.tabs.setTabText(self.installed_tab_index, f"Installed Packages ({self.total_installed_packages})")
-        self.tabs.setTabText(self.update_tab_index, f"Updates ({self.total_updates})")
 
+    def get_selected_items(self, list_widget):
+        """Helper to get the text of selected items from a QListWidget."""
+        items = list_widget.selectedItems()
+        # Return only the package atom part (cat/pkg)
+        results = []
+        for item in items:
+             text = item.text()
+             # Simple match assuming format 'cat/pkg' or 'cat/pkg-version...'
+             match = re.match(r'([\w-]+/[\w+-.]+)', text)
+             if match:
+                 results.append(match.group(1))
+             else:
+                 print(f"Warning: Could not parse package atom from selected item: {text}") # Log warning
+        return results
 
     # --- Specific Actions ---
 
@@ -672,413 +714,345 @@ class GentooPackageManagerGUI(QMainWindow):
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Sync")
         msg_box.setText("This will synchronize the package repositories using 'emerge --sync'. This may take some time and requires root privileges (via pkexec). Continue?")
-        msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setDefaultButton(QMessageBox.StandardButton.No)
         if msg_box.exec() == QMessageBox.StandardButton.Yes:
-            self.run_command(
+            self.run_emerge_command(
                 ['emerge', '--sync'],
-                on_finished=self._sync_finished, # Refresh updates list after sync
-                use_pkexec=True,
-                operation_name="Sync Repositories"
+                on_finished=self._sync_finished,
+                on_error=None, # Use default error handling
+                status_message="Running emerge --sync...",
+                use_pkexec=True
             )
 
     def _sync_finished(self):
-        self.status_bar.showMessage("Sync finished. Checking for updates...", 3000)
+        self.status_bar.showMessage("Sync finished. Refreshing updates list...", 3000)
         self.refresh_updates() # Refresh updates list after sync
 
     def refresh_all(self):
-        self.status_bar.showMessage("Refreshing all data...", 0) # Persistent message
-        # Clear existing views immediately for visual feedback
-        self.installed_package_list_widget.clear()
-        self.update_package_list.clear()
-        self.package_tree.clear()
-        # Reset counts
-        self.total_available_packages = 0
-        self.total_installed_packages = 0
-        self.total_updates = 0
-        self.update_tab_titles() # Show zero counts
+        """Reloads all dynamic package lists."""
+        self.status_bar.showMessage("Refreshing all package lists...", 0) # Persistent message
+        # Clear existing views (optional, lists will be cleared by refresh functions)
+        # self.installed_package_list.clear()
+        # self.browse_package_list.clear()
+        # self.update_package_list.clear()
+        # Reset tab counts to loading state
+        self.update_tab_text(self.browse_tab_index, "browse", None)
+        self.update_tab_text(self.installed_tab_index, "installed", None)
+        self.update_tab_text(self.update_tab_index, "updates", None)
 
-        # Trigger background loading/refreshing
-        # These now use run_command and handle progress/errors
-        self.load_all_available_packages()
+        # Start refresh tasks (they run in background)
         self.refresh_installed_packages()
+        self.load_all_available_packages()
         self.refresh_updates()
         self.refresh_disk_space()
 
-        # The status bar message will be updated by each operation as it finishes/fails
-        # No single "Refresh complete" message needed as operations are async.
+        # Status bar message will be updated by individual tasks finishing
+        # Optionally, add a short "Refresh complete" message after a delay
+        # QTimer.singleShot(2000, lambda: self.status_bar.showMessage("Refresh initiated.", 5000))
 
 
     def load_all_available_packages(self):
-        """Loads categories and all available packages using equery in a thread."""
-        self.run_command(
-            ['equery', 'list', '*/*'],
-            on_result=self._parse_available_packages,
-            on_error=lambda msg: self._load_available_failed(msg), # Specific error handler
-            return_stdout=True, # Need the output lines
-            operation_name="Load Available Packages"
+        """Loads all available packages using equery list in a background thread."""
+        self.update_tab_text(self.browse_tab_index, "browse", None) # Show loading state
+        self.browse_package_list.clear()
+        self.browse_package_list.addItem("Loading available packages...")
+
+        def parse_equery_list(lines):
+            packages = []
+            # Regex to capture 'category/package-version' potentially with repo info
+            # Focus on extracting 'category/package'
+            pkg_pattern = re.compile(r'^\s*([\w-]+/[\w+-.]+)-[\d.]') # Basic cat/pkg-ver
+            for line in lines:
+                 if '[ Searching ... ]' in line or '[ Completed' in line or not line:
+                     continue
+                 match = pkg_pattern.match(line.strip())
+                 if match:
+                     packages.append(match.group(1)) # Add only cat/pkg
+                 # else:
+                     # print(f"Debug: Skipped line in equery list parse: {line}") # Optional debug
+            return sorted(list(set(packages))) # Sort and remove duplicates
+
+        def on_load_available_result(packages):
+            self.all_available_packages = packages # Store the full list
+            self.browse_package_list.clear() # Clear "Loading..." message
+            self.browse_package_list.addItems(self.all_available_packages)
+            count = len(self.all_available_packages)
+            self.update_tab_text(self.browse_tab_index, "browse", count)
+            self.status_bar.showMessage(f"Loaded {count} available packages.", 5000)
+            # Apply filter if user typed while loading
+            self.filter_browse_packages()
+
+        def on_load_available_error(error_msg):
+             self.browse_package_list.clear()
+             self.browse_package_list.addItem(f"Error loading packages: {error_msg.splitlines()[0]}")
+             self.update_tab_text(self.browse_tab_index, "browse", 0) # Show count as 0 on error
+             # Error message already shown by _command_error
+
+        self.run_generic_task(
+            command_list=['equery', 'list', '*/*'],
+            parser_func=parse_equery_list,
+            on_result=on_load_available_result,
+            on_finished=None, # Handled by on_result
+            on_error=on_load_available_error, # Custom error handling for this view
+            status_message="Loading available packages (equery list)..."
         )
-
-    def _parse_available_packages(self, output_lines):
-        """ Parses the output of `equery list */*` """
-        self.status_bar.showMessage("Parsing available packages...")
-        self.package_tree.clear()
-        self.available_packages_tree = {}
-        package_count = 0
-
-        temp_tree = {} # Build temp structure first: {cat: [pkg, pkg...]}
-
-        for line in output_lines:
-            if '[ Searching ... ]' in line or '[ Completed' in line or not line.strip():
-                continue
-            # Improved regex to handle various package name characters
-            match = re.match(r'^\s*([\w+.@_-]+/[\w+.@_-]+)-([\d.].*)', line.strip()) # More robust cat/pkg match
-            if match:
-                full_atom = match.group(0).strip() # Keep full line for reference if needed
-                category = match.group(1).split('/')[0]
-                package_name_with_version = match.group(1).split('/')[1] + "-" + match.group(2)
-                # Store just category/package for actionability? Or full version?
-                # Let's store just cat/pkg for simplicity in the tree data
-                package_atom = match.group(1)
-
-                if category not in temp_tree:
-                    temp_tree[category] = []
-
-                if package_atom not in temp_tree[category]: # Avoid duplicates based on atom
-                    temp_tree[category].append(package_atom)
-                    package_count += 1
-
-            # Basic progress update in status bar (optional)
-            # if package_count % 500 == 0:
-            #     self.status_bar.showMessage(f"Parsing available packages... ({package_count})")
-            #     QApplication.processEvents() # Keep UI responsive during intensive parsing
-
-        # Populate the tree widget from the sorted structure
-        self.total_available_packages = package_count
-        sorted_categories = sorted(temp_tree.keys())
-        for category in sorted_categories:
-            cat_item = QTreeWidgetItem(self.package_tree, [category])
-            cat_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "category"}) # Store type
-            # Sort packages within category
-            sorted_packages = sorted(temp_tree[category])
-            for package_atom in sorted_packages:
-                 pkg_item = QTreeWidgetItem(cat_item, [package_atom])
-                 pkg_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "package", "atom": package_atom}) # Store type and atom
-
-        # Store the parsed structure if needed elsewhere
-        self.available_packages_tree = temp_tree
-
-        self.package_tree.resizeColumnToContents(0) # Adjust column width
-        self.update_tab_titles()
-        # Status message handled by _command_finished or _command_error
-        self.status_bar.showMessage(f"Available packages loaded ({self.total_available_packages}).", 5000)
-
-
-    def _load_available_failed(self, error_msg):
-        """ Handle failure specifically for loading available packages """
-        self.total_available_packages = 0
-        self.update_tab_titles()
-        if "equery: not found" in error_msg or "'equery' command not found" in error_msg:
-             self.show_error("Error: 'equery' command not found. Please install app-portage/gentoolkit.")
-        # else: # General error already shown by _command_error
-        #     pass
 
 
     def refresh_installed_packages(self):
-        """ Loads installed packages using equery in a thread. """
-        self.run_command(
-            ['equery', 'list', '--installed', '*/*'],
-            on_result=self._parse_installed_packages,
-            on_error=lambda msg: self._load_installed_failed(msg),
-            return_stdout=True,
-            operation_name="Load Installed Packages"
+        """Loads installed packages using equery list in a background thread."""
+        self.update_tab_text(self.installed_tab_index, "installed", None)
+        self.installed_package_list.clear()
+        self.installed_package_list.addItem("Loading installed packages...")
+
+        def parse_installed(lines):
+            # Format is usually 'cat/pkg-ver', keep full string for display
+            installed = sorted([line for line in lines if not line.startswith('[') and line.strip()])
+            return installed
+
+        def on_installed_result(packages):
+            self.installed_packages = packages # Store full list with versions
+            self.installed_package_list.clear() # Clear "Loading..."
+            self.installed_package_list.addItems(self.installed_packages)
+            count = len(self.installed_packages)
+            self.update_tab_text(self.installed_tab_index, "installed", count)
+            self.status_bar.showMessage(f"{count} installed packages loaded.", 5000)
+            # Apply filter if user typed while loading
+            self.filter_installed_packages()
+
+        def on_installed_error(error_msg):
+            self.installed_package_list.clear()
+            self.installed_package_list.addItem(f"Error loading packages: {error_msg.splitlines()[0]}")
+            self.update_tab_text(self.installed_tab_index, "installed", 0)
+
+        self.run_generic_task(
+            command_list=['equery', 'list', '--installed', '*/*'],
+            parser_func=parse_installed,
+            on_result=on_installed_result,
+            on_finished=None,
+            on_error=on_installed_error,
+            status_message="Loading installed packages..."
         )
-
-    def _parse_installed_packages(self, output_lines):
-        self.status_bar.showMessage("Parsing installed packages...")
-        self.installed_packages_list = []
-        self.installed_package_atoms = {} # Reset map
-        self.installed_package_list_widget.clear()
-        count = 0
-
-        temp_list = []
-        for line in output_lines:
-            line_strip = line.strip()
-            if not line_strip or line_strip.startswith('['): # Skip empty/status lines
-                continue
-            # Match category/package-version
-            match = re.match(r'([\w+.@_-]+/[\w+.@_-]+)-([\d.].*)', line_strip)
-            if match:
-                atom = match.group(1)
-                temp_list.append(line_strip)
-                self.installed_package_atoms[line_strip] = atom # Map full string to atom
-                count += 1
-            # else: print(f"DEBUG: No match for installed: {line_strip}") # Debug non-matching lines
-
-
-        self.installed_packages_list = sorted(temp_list)
-        self.installed_package_list_widget.addItems(self.installed_packages_list)
-        self.total_installed_packages = count
-        self.update_tab_titles()
-        self.status_bar.showMessage(f"{self.total_installed_packages} installed packages loaded.", 5000)
-
-
-    def _load_installed_failed(self, error_msg):
-        self.total_installed_packages = 0
-        self.update_tab_titles()
-        if "equery: not found" in error_msg or "'equery' command not found" in error_msg:
-             self.show_error("Error: 'equery' command not found. Please install app-portage/gentoolkit.")
 
 
     def refresh_updates(self):
-        """ Checks for updates using emerge -upvND @world in a thread. """
-        # No pkexec needed for checking usually, emerge handles permissions internally for pretend.
-        # If errors occur, pkexec might be needed depending on system config.
-        self.run_command(
-            ['emerge', '-upvND', '@world'],
-            on_result=self._parse_updates,
-            # Use default error handling from run_command initially
-            return_stdout=True,
-            operation_name="Check for Updates"
-        )
-
-    def _parse_updates(self, output_lines):
-        self.status_bar.showMessage("Parsing updates...")
-        self.update_list_display = []
-        self.update_list_atoms = []
+        """Checks for updates using emerge -upvND @world in a background thread."""
+        self.update_tab_text(self.update_tab_index, "updates", None)
         self.update_package_list.clear()
-        count = 0
+        self.update_package_list.addItem("Checking for updates...")
 
-        # Regex to find lines like: [ebuild U ] sys-kernel/gentoo-sources-6.1.12 -> 6.1.16 [6.1.9]
-        # Or: [ebuild N ] dev-python/requests-2.28.2
-        # Or: [ebuild R ] media-libs/libpng-1.6.39 (Rebuild)
-        # Or: [ebuild UD] ... (Downgrade)
-        # We capture the package atom (cat/pkg) and display info.
-        update_pattern = re.compile(
-            r"\[ebuild\s+"        # Start with [ebuild
-            r"([A-Z]+)"           # Flags (U, N, R, D etc.)
-            r"[^\]]*\]\s+"        # Rest of flags section and space
-            r"([\w+.@_-]+/[\w+.@_-]+)" # Package Atom (cat/pkg)
-            r"(?:-[\d.].*)?"      # Optional current version part
-            r"\s*(?:->\s*([\d.].*))?" # Optional new version part (-> X.Y.Z)
-            r".*"                 # Rest of the line (USE flags etc)
+        # Regex needs to be defined here or accessible to the parser
+        update_pattern = re.compile(r"\[ebuild\s+(U|N|R).*\s+([\w-]+/[\w+-.]+)-([\d.]+.*)\s*(?:->\s*([\d.]+.*))?")
+
+        def parse_updates(lines):
+            updates_atoms = []
+            updates_display = []
+            # Parse emerge output here
+            for line in lines:
+                if line.startswith('[ebuild'):
+                    match = update_pattern.search(line)
+                    if match:
+                        pkg_cat_name = match.group(2) # e.g., sys-kernel/gentoo-sources
+                        flag = match.group(1) # U, N, R
+                        # current_ver = match.group(3) if match.group(3) else ""
+                        new_ver = f"-> {match.group(4)}" if match.group(4) else ""
+
+                        flag_map = {'U': 'Update', 'N': 'New', 'R': 'Rebuild'}
+                        flag_text = flag_map.get(flag, flag) # e.g. 'Update'
+
+                        display_text = f"{pkg_cat_name} {new_ver} [{flag_text}]"
+                        updates_atoms.append(pkg_cat_name) # Store the actionable atom
+                        updates_display.append(display_text)
+
+            return {"atoms": sorted(list(set(updates_atoms))), "display": sorted(updates_display)}
+
+        def on_updates_result(update_data):
+            self.update_list_atoms = update_data["atoms"]
+            self.update_list_display = update_data["display"]
+            self.update_package_list.clear()
+            count = len(self.update_list_atoms)
+            if count == 0:
+                self.update_package_list.addItem("No updates available.")
+                self.status_bar.showMessage("System is up to date.", 5000)
+            else:
+                self.update_package_list.addItems(self.update_list_display)
+                self.status_bar.showMessage(f"{count} updates available.", 5000)
+            self.update_tab_text(self.update_tab_index, "updates", count)
+
+        def on_updates_error(error_msg):
+            # Emerge might return non-zero if no updates are found, check output
+            if "There are no packages to update" in error_msg or "Nothing to merge" in error_msg:
+                 # This is not really an error in the context of checking
+                 on_updates_result({"atoms": [], "display": []}) # Process as no updates found
+            elif "Permission denied" in error_msg or "are you root?" in error_msg:
+                 self.update_package_list.clear()
+                 self.update_package_list.addItem(f"Permission error checking updates.")
+                 self.show_error(f"Permission error checking for updates. Try running 'emerge -upvND @world' manually or check permissions.\nDetails:\n{error_msg}")
+                 self.update_tab_text(self.update_tab_index, "updates", 0)
+            else:
+                 # Actual error
+                 self.update_package_list.clear()
+                 self.update_package_list.addItem(f"Error checking updates: {error_msg.splitlines()[0]}")
+                 self.show_error(f"Error checking for updates:\n{error_msg}") # Show full error
+                 self.update_tab_text(self.update_tab_index, "updates", 0)
+
+
+        # emerge -upvND can sometimes require root-like permissions even for pretend
+        # Depending on config. Let's try without pkexec first.
+        self.run_generic_task(
+            command_list=['emerge', '-upvND', '@world'],
+            parser_func=parse_updates,
+            on_result=on_updates_result,
+            on_finished=None, # Handled by result/error
+            on_error=on_updates_error, # Custom error handler for emerge output
+            status_message="Checking for updates (emerge -upvND @world)..."
         )
 
-        for line in output_lines:
-            if line.startswith('[ebuild'):
-                match = update_pattern.search(line)
-                if match:
-                    flags = match.group(1)
-                    pkg_atom = match.group(2) # e.g., sys-kernel/gentoo-sources
-                    new_ver_part = match.group(4) if match.group(4) else None
-
-                    # Determine action type for display
-                    action = ""
-                    if 'U' in flags and 'D' in flags: action = "Downgrade"
-                    elif 'U' in flags: action = "Update"
-                    elif 'N' in flags: action = "New Dependency"
-                    elif 'R' in flags: action = "Rebuild"
-                    else: action = flags # Fallback to flags
-
-                    # Construct display text
-                    display_text = f"{pkg_atom}"
-                    if new_ver_part:
-                        display_text += f" -> {new_ver_part}"
-                    display_text += f" ({action})"
-
-                    # Store actionable atom and display text
-                    if pkg_atom not in self.update_list_atoms: # Avoid duplicates if line appears twice
-                        self.update_list_atoms.append(pkg_atom)
-                        self.update_list_display.append(display_text)
-                        count += 1
-
-        if not self.update_list_atoms:
-             self.status_bar.showMessage("System is up to date.", 5000)
-             self.update_package_list.addItem("No updates available.")
-             self.total_updates = 0
-        else:
-             # Sort updates before adding
-             sorted_updates = sorted(self.update_list_display)
-             self.update_package_list.addItems(sorted_updates)
-             self.total_updates = count
-             self.status_bar.showMessage(f"{self.total_updates} updates available.", 5000)
-
-        self.update_tab_titles()
-
+    # --- Search functionality was integrated into Browse/Installed tabs ---
+    # def search_packages(self): -- REMOVED --
 
     def _install_packages(self, packages_to_install):
         if not packages_to_install:
             self.show_error("No packages selected to install.")
             return
 
-        # Filter out any non-package items (e.g., category selections from tree)
-        package_atoms = []
-        for pkg in packages_to_install:
-             # Simple check if it looks like cat/pkg
-             if isinstance(pkg, str) and '/' in pkg and not pkg.endswith('/'):
-                 # Basic atomization: remove version string if present (e.g., from double click)
-                 atom = re.sub(r'-[\d.].*$', '', pkg)
-                 if atom not in package_atoms:
-                     package_atoms.append(atom)
+        # Ensure we have cat/pkg atoms
+        atoms_to_install = [re.sub(r'-[\d\._].*', '', pkg) for pkg in packages_to_install]
+        atoms_to_install = list(set(atoms_to_install)) # Unique atoms
 
-        if not package_atoms:
-             self.show_error("No valid package atoms selected.")
+        if not atoms_to_install:
+             self.show_error("Could not determine valid packages to install from selection.")
              return
 
-        package_str = " ".join(package_atoms)
+        package_str = " ".join(atoms_to_install)
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Installation")
-        msg_box.setText(f"The following packages will be installed:\n\n{package_str}\n\nThis requires root privileges (via pkexec). Continue?")
+        msg_box.setText(f"The following packages (and dependencies) will be installed:\n\n{package_str}\n\nThis requires root privileges (via pkexec). Continue?")
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setDefaultButton(QMessageBox.StandardButton.No)
 
         if msg_box.exec() == QMessageBox.StandardButton.Yes:
-            command = ['emerge', '--ask=n'] + package_atoms # Use parsed atoms
-            self.run_command(
+            command = ['emerge', '--ask=n'] + atoms_to_install
+            self.run_emerge_command(
                 command,
-                on_finished=self._install_finished, # Refresh lists after success
-                use_pkexec=True,
-                operation_name="Install Packages"
+                on_finished=self._install_finished,
+                on_error=None, # Default handler
+                status_message=f"Installing {len(atoms_to_install)} package(s)...",
+                use_pkexec=True
             )
 
     def _install_finished(self):
-        # Called on successful install completion
-        self.status_bar.showMessage("Installation finished. Refreshing package lists...", 3000)
+        self.status_bar.showMessage("Installation finished. Refreshing lists...", 3000)
         self.refresh_installed_packages()
         self.refresh_updates() # Check if installed packages resolved update needs
 
-
     def install_selected_browse(self):
-        """ Install packages selected from the package_tree """
-        selected_items = self.package_tree.selectedItems()
-        packages_to_install = []
-        for item in selected_items:
-            item_data = item.data(0, Qt.ItemDataRole.UserRole)
-            # Only add items marked as packages (not categories)
-            if item_data and item_data.get("type") == "package":
-                packages_to_install.append(item_data.get("atom", item.text(0))) # Use stored atom if available
+        # Get selected items directly from the list widget
+        selected_items = [item.text() for item in self.browse_package_list.selectedItems()]
+        self._install_packages(selected_items)
 
-        if not packages_to_install:
-             self.show_error("Please select one or more packages (not categories) to install.")
-             return
-        self._install_packages(packages_to_install)
+    # def install_selected_search(self): -- REMOVED --
 
 
     def uninstall_selected(self):
-        selected_items = self.installed_package_list_widget.selectedItems()
-        if not selected_items:
+        selected_packages_with_ver = [item.text() for item in self.installed_package_list.selectedItems()]
+        if not selected_packages_with_ver:
             self.show_error("No packages selected to uninstall.")
             return
 
+        # Extract cat/pkg atoms from the selection (e.g., 'cat/pkg-ver' -> 'cat/pkg')
         packages_to_uninstall_atoms = []
-        display_names = []
-        for item in selected_items:
-            full_name = item.text()
-            display_names.append(full_name)
-            # Look up the atom from the pre-parsed map
-            atom = self.installed_package_atoms.get(full_name)
-            if atom and atom not in packages_to_uninstall_atoms:
-                 packages_to_uninstall_atoms.append(atom)
-            elif not atom:
-                 # Fallback: try to parse atom if not found in map (shouldn't happen ideally)
-                 match = re.match(r'([\w+.@_-]+/[\w+.@_-]+)-[\d.].*', full_name)
-                 if match and match.group(1) not in packages_to_uninstall_atoms:
-                     packages_to_uninstall_atoms.append(match.group(1))
-
+        for item in selected_packages_with_ver:
+            match = re.match(r'([\w-]+/[\w+-.]+)-[\d.]+', item)
+            if match:
+                packages_to_uninstall_atoms.append(match.group(1))
+            else:
+                 # Fallback: if format is just cat/pkg (unlikely from equery list --installed)
+                 if '/' in item and not item.endswith('/'):
+                      packages_to_uninstall_atoms.append(item)
+                 else:
+                      print(f"Warning: Could not parse atom from installed list: {item}")
 
         if not packages_to_uninstall_atoms:
-             self.show_error("Could not determine package atoms to uninstall.")
-             return
+            self.show_error("Could not determine valid packages to uninstall from selection.")
+            return
 
-
-        package_str = "\n".join(display_names) # Show full names in confirmation
+        package_str = " ".join(packages_to_uninstall_atoms)
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Uninstallation")
-        # Clarify the command being used
-        msg_box.setText(f"The following packages will be uninstalled using 'emerge --unmerge':\n\n{package_str}\n\nNOTE: This does NOT automatically remove dependencies. Consider using 'emerge --depclean' afterwards.\n\nThis requires root privileges (via pkexec). Continue?")
+        # Adjusted text to reflect --unmerge behavior better
+        msg_box.setText(f"The following packages will be unmerged:\n\n{package_str}\n\nThis uses 'emerge --unmerge' which removes the selected packages but might leave unused dependencies. Consider running 'emerge --depclean' afterwards.\n\nRequires root privileges (via pkexec). Continue?")
         msg_box.setIcon(QMessageBox.Icon.Warning)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setDefaultButton(QMessageBox.StandardButton.No)
 
         if msg_box.exec() == QMessageBox.StandardButton.Yes:
-            # Use --unmerge for simplicity as noted in original code.
             command = ['emerge', '--ask=n', '--unmerge'] + packages_to_uninstall_atoms
-            self.run_command(
+            self.run_emerge_command(
                 command,
-                on_finished=self._uninstall_finished, # Refresh lists after success
-                use_pkexec=True,
-                operation_name="Uninstall Packages"
+                on_finished=self._uninstall_finished,
+                on_error=None, # Default handler
+                status_message=f"Unmerging {len(packages_to_uninstall_atoms)} package(s)...",
+                use_pkexec=True
             )
 
     def _uninstall_finished(self):
-        self.status_bar.showMessage("Uninstallation finished. Refreshing package lists...", 3000)
+        self.status_bar.showMessage("Uninstallation finished. Refreshing lists...", 3000)
         self.refresh_installed_packages()
         self.refresh_updates()
 
 
     def update_selected(self):
-        selected_items = self.update_package_list.selectedItems()
-        if not selected_items:
+        selected_items_display = [item.text() for item in self.update_package_list.selectedItems()]
+        if not selected_items_display:
             self.show_error("No updates selected.")
             return
 
-        # Extract package atoms (cat/pkg) from the internal list based on selection index
-        packages_to_update = []
-        # Need to map selected display text back to atoms, or store atoms alongside display text
-        # Simpler: Use the index of selection to get atom from self.update_list_atoms
-        # This assumes self.update_list_display and self.update_list_atoms are ordered identically to the QListWidget items
-        # which should be true if populated correctly.
+        # Extract package atoms (cat/pkg) from the display text
+        packages_to_update_atoms = []
+        for item_text in selected_items_display:
+            match = re.match(r'([\w-]+/[\w+-.]+)', item_text) # Match cat/pkg at the start
+            if match:
+                packages_to_update_atoms.append(match.group(1))
 
-        # Find the indices of selected items
-        selected_indices = {self.update_package_list.row(item) for item in selected_items}
+        if not packages_to_update_atoms:
+            self.show_error("Could not parse package names from selection.")
+            return
 
-        # Match indices to atoms (assuming order is preserved)
-        # Create a temporary sorted list of display/atom pairs based on display text to match list widget sorting
-        display_atom_pairs = sorted(zip(self.update_list_display, self.update_list_atoms))
-
-        for i, (display, atom) in enumerate(display_atom_pairs):
-            if i in selected_indices:
-                if atom not in packages_to_update: # Avoid duplicates
-                    packages_to_update.append(atom)
-
-
-        if not packages_to_update:
-             self.show_error("Could not parse package names from selection.")
-             return
-
-        self._perform_update(packages_to_update)
+        self._perform_update(packages_to_update_atoms)
 
 
     def update_all(self):
-        if not self.update_list_atoms: # Check the atoms list
+        # Check the *parsed* list of atoms needing updates
+        if not self.update_list_atoms:
             self.show_error("No updates available or list not refreshed.")
             return
-        # Use '@world' to perform a full update, easier than managing individual atoms
+        # Use '@world' to let emerge handle all needed updates/dependencies
         self._perform_update(['@world'])
 
     def _perform_update(self, packages_or_world):
-        """ Performs the emerge update command """
         package_str = " ".join(packages_or_world)
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Confirm Update")
-        msg_box.setText(f"The following will be updated:\n\n{package_str}\n\nThis uses 'emerge -uND'. Requires root privileges (via pkexec). Continue?")
+        msg_box.setText(f"The following will be updated (using emerge -uND):\n\n{package_str}\n\nThis requires root privileges (via pkexec). Continue?")
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setDefaultButton(QMessageBox.StandardButton.No)
 
         if msg_box.exec() == QMessageBox.StandardButton.Yes:
+            # Use -uND (Update, NewUse, Deep) flags
             command = ['emerge', '--ask=n', '-uND'] + packages_or_world
-            self.run_command(
+            self.run_emerge_command(
                 command,
-                on_finished=self._update_finished, # Refresh lists after success
-                use_pkexec=True,
-                operation_name="Update Packages"
+                on_finished=self._update_finished,
+                on_error=None, # Default handler
+                status_message=f"Updating {package_str}...",
+                use_pkexec=True
             )
 
     def _update_finished(self):
-        self.status_bar.showMessage("Update finished. Refreshing package lists...", 3000)
+        self.status_bar.showMessage("Update finished. Refreshing lists...", 3000)
         self.refresh_installed_packages()
         self.refresh_updates() # Refresh updates list
 
@@ -1087,40 +1061,26 @@ class GentooPackageManagerGUI(QMainWindow):
         try:
             stats = os.statvfs('/')
             total_bytes = stats.f_blocks * stats.f_frsize
-            available_bytes = stats.f_bavail * stats.f_frsize
+            available_bytes = stats.f_bavail * stats.f_frsize # Available to non-root
+            # Calculate used bytes more accurately
+            used_bytes = total_bytes - (stats.f_bfree * stats.f_frsize) # Total - free (incl. reserved)
 
             total_gb = total_bytes / (1024**3)
             available_gb = available_bytes / (1024**3)
-            used_gb = total_gb - available_gb # Calculate used based on total and available
+            used_gb = used_bytes / (1024**3)
 
-            # Format string with more context
-            disk_info = f"Disk (/): {used_gb:.1f}GB Used / {total_gb:.1f}GB Total ({available_gb:.1f}GB Free)"
+            # Format string: Used / Total GB (Available GB Free)
+            disk_info = f"Disk (/): {used_gb:.1f}/{total_gb:.1f} GB ({available_gb:.1f} GB Free)"
             self.disk_space_label.setText(disk_info)
-            self.disk_space_label.setToolTip(f"Total: {total_bytes} bytes\nAvailable: {available_bytes} bytes")
 
         except Exception as e:
             self.disk_space_label.setText("Disk: Error")
-            self.disk_space_label.setToolTip(f"Error getting disk space: {e}")
             print(f"Error getting disk space: {e}") # Log error
 
 
-    def cancel_operation(self):
-        if self.current_worker and self.current_worker.isRunning():
-            self.status_bar.showMessage("Attempting to cancel operation...")
-            self.current_worker.stop()
-            # GUI updates (disabling cancel button, hiding progress bar) are handled
-            # by the _command_error slot when the "Operation Cancelled" signal is emitted.
-        else:
-            self.status_bar.showMessage("No operation running to cancel.", 3000)
-
     # --- Utility Functions ---
     def show_error(self, message):
-        """ Displays a critical error message box. """
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Icon.Critical)
-        msg_box.setWindowTitle("Error")
-        msg_box.setText(message)
-        msg_box.exec()
+        QMessageBox.critical(self, "Error", message)
 
     def closeEvent(self, event):
         # Ensure any running worker is stopped before closing
@@ -1131,29 +1091,41 @@ class GentooPackageManagerGUI(QMainWindow):
                                          QMessageBox.StandardButton.No)
 
             if reply == QMessageBox.StandardButton.Yes:
+                self.status_bar.showMessage("Exiting: Cancelling operation...")
                 self.cancel_operation()
-                # Give a moment for cancellation signal to process if needed
-                # self.current_worker.wait(1000) # Wait up to 1 second
-                event.accept() # Allow closing
+                # Give the thread a moment to acknowledge the stop request
+                if self.current_worker:
+                     # Wait briefly, but don't block exit for too long
+                     self.current_worker.wait(500) # Wait max 0.5 sec
+                event.accept()
             else:
-                event.ignore() # Prevent closing
+                event.ignore()
         else:
-            event.accept() # No operation running, close normally
+            event.accept()
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Check if running as root - recommend against it
-    if os.geteuid() == 0:
-        print("------------------------------------------------------------")
-        print("WARNING: Running this GUI directly as root is not recommended.")
-        print("Please run as a regular user.")
-        print("Operations requiring privileges should use pkexec.")
-        print("------------------------------------------------------------")
-        # Allow running, but warn strongly.
-        # sys.exit("Exiting: Please run as a non-root user.")
+    # Check if running as root - recommend against it, pkexec is preferred
+    try:
+        if os.geteuid() == 0:
+             print("--------------------------------------------------------------------")
+             print("WARNING: Running this GUI directly as root is not recommended!")
+             print("Please run as a regular user. Operations requiring privileges")
+             print("should automatically use 'pkexec' if PolicyKit is configured.")
+             print("Continuing, but be aware of the security implications.")
+             print("--------------------------------------------------------------------")
+            # Allow running as root, but warn strongly.
+            # sys.exit("Exiting: Please run as a non-root user.")
+    except AttributeError:
+        # os.geteuid() doesn't exist on Windows, ignore the check.
+        pass
+
 
     app = QApplication(sys.argv)
+    # Ensure the application uses the configured style and palette
+    app.setStyle("Fusion") # Or another style that works well with palettes/stylesheets
+
     main_window = GentooPackageManagerGUI()
     main_window.show()
     sys.exit(app.exec())
