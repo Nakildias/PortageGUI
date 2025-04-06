@@ -11,10 +11,14 @@ set -o pipefail
 APP_NAME="PortageGUI"
 PYTHON_SCRIPT_NAME="${APP_NAME}.py"
 LAUNCHER_NAME="${APP_NAME}"
-VENV_DIR="/opt/${APP_NAME}" # Installation directory for venv and script
+# Standard location for optional software packages
+INSTALL_BASE_DIR="/opt"
+VENV_DIR="${INSTALL_BASE_DIR}/${APP_NAME}" # Installation directory for venv and script
 VENV_PATH="${VENV_DIR}/venv"
-LAUNCHER_PATH="/usr/local/bin/${LAUNCHER_NAME}" # Use /usr/local/bin for local installs
-ALIAS_FILE="/etc/profile.d/portagegui.sh" # System-wide aliases
+# Use /usr/local/bin for locally installed executables/scripts
+LAUNCHER_PATH="/usr/local/bin/${LAUNCHER_NAME}"
+# Standard location for system-wide shell configuration snippets
+ALIAS_FILE="/etc/profile.d/${APP_NAME,,}.sh" # Use lowercase name for convention
 
 # --- Helper Functions ---
 log_info() {
@@ -22,16 +26,18 @@ log_info() {
 }
 
 log_warning() {
+    # Output warnings to standard error
     echo "[WARN] $1" >&2
 }
 
 log_error() {
+    # Output errors to standard error and exit
     echo "[ERROR] $1" >&2
     exit 1
 }
 
 # --- Pre-flight Checks ---
-log_info "Starting PortageGUI installation script..."
+log_info "Starting ${APP_NAME} installation script..."
 
 # 1. Check if running as root
 if [[ "${EUID}" -ne 0 ]]; then
@@ -54,95 +60,135 @@ log_info "Found Python script: ${SCRIPT_SOURCE_PATH}"
 
 # --- Installation Steps ---
 
-# 3. Install Gentoo dependencies (emerge)
-#    - dev-python/pyqt6: For the GUI toolkit itself (Qt6 bindings)
-#    - app-portage/gentoolkit: Provides 'equery' used in the script
-#    - app-portage/eix: Provides 'eix' used in the script (alternative: could use only equery)
-#    - sys-auth/polkit: Provides 'pkexec' for privilege escalation
+# 4. Install Gentoo system dependencies (emerge)
+#    - dev-python/pyqt6: Provides Qt6 bindings AND ensures system Qt6 libs are present.
+#                        *** Using emerge is strongly recommended over pip for PyQt6 on Gentoo. ***
+#    - app-portage/gentoolkit: Provides 'equery' (often used in Portage helper scripts).
+#    - app-portage/eix: Provides 'eix' (optional alternative/addition to equery).
+#    - sys-auth/polkit: Provides 'pkexec' for running commands as root from the GUI.
 log_info "Installing required Gentoo packages using emerge..."
-log_info "This step requires user confirmation ('--ask')."
-emerge --ask --verbose dev-python/pyqt6 app-portage/gentoolkit app-portage/eix sys-auth/polkit || log_error "Failed to install emerge dependencies."
-log_info "Emerge dependencies should now be installed."
+log_info "This step requires user confirmation ('--ask'). Dependencies: dev-python/pyqt6, app-portage/gentoolkit, app-portage/eix, sys-auth/polkit"
+emerge --ask --verbose dev-python/pyqt6 app-portage/gentoolkit app-portage/eix sys-auth/polkit || log_error "Failed to install emerge dependencies. Check emerge output for details."
+log_info "Emerge dependencies installation command finished."
 
-# 4. Configure Python for Qt6 (Handled by emerge dev-python/pyqt6)
-log_info "Python configuration for PyQt6 is handled by the 'emerge dev-python/pyqt6' step."
-
-# 5. Create application directory and venv
-log_info "Creating application directory and Python virtual environment..."
+# 5. Create application directory and Python virtual environment
+log_info "Setting up application directory and Python virtual environment..."
 if [[ -d "${VENV_DIR}" ]]; then
-    log_warning "Installation directory '${VENV_DIR}' already exists. Skipping creation."
+    log_warning "Installation directory '${VENV_DIR}' already exists. Contents may be overwritten."
 else
     mkdir -p "${VENV_DIR}" || log_error "Failed to create directory '${VENV_DIR}'."
-    log_info "Created directory: ${VENV_DIR}"
+    log_info "Created application directory: ${VENV_DIR}"
 fi
 
-if [[ -d "${VENV_PATH}" ]]; then
-    log_warning "Virtual environment '${VENV_PATH}' already exists. Skipping creation."
-    # Optionally, you could offer to recreate it here.
-else
-    "${PYTHON3_EXEC}" -m venv "${VENV_PATH}" || log_error "Failed to create Python virtual environment at '${VENV_PATH}'."
-    log_info "Created virtual environment: ${VENV_PATH}"
+# Ensure VENV_PATH doesn't exist or remove it if user confirms (optional safety)
+# if [[ -d "${VENV_PATH}" ]]; then
+#   read -p "[WARN] Virtual environment '${VENV_PATH}' already exists. Remove and recreate? (y/N): " confirm
+#   if [[ "${confirm}" =~ ^[Yy]$ ]]; then
+#       log_info "Removing existing virtual environment..."
+#       rm -rf "${VENV_PATH}" || log_error "Failed to remove existing venv."
+#   else
+#       log_warning "Keeping existing virtual environment. Pip dependencies might not be correct."
+#       # Skip venv creation if kept? Or force install deps? Depends on desired behavior.
+#       # Forcing install is safer if we keep the existing venv.
+#   fi
+# fi
+
+# Create venv if it doesn't exist (or after removal)
+if [[ ! -d "${VENV_PATH}" ]]; then
+    log_info "Creating Python virtual environment at '${VENV_PATH}'..."
+    "${PYTHON3_EXEC}" -m venv "${VENV_PATH}" || log_error "Failed to create Python virtual environment."
+    log_info "Virtual environment created."
 fi
 
-# 6. Move Python script to the application directory
+# 6. Copy Python script to the application directory
 log_info "Copying Python script to ${VENV_DIR}..."
-cp "${SCRIPT_SOURCE_PATH}" "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" || log_error "Failed to copy Python script."
-chmod 644 "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" # Set standard read permissions
+cp -p "${SCRIPT_SOURCE_PATH}" "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" || log_error "Failed to copy Python script."
+# -p preserves permissions, but let's ensure owner/group/perms are reasonable anyway
+chown root:root "${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
+chmod 644 "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" # Read for all, write for owner (root)
+log_info "Python script copied."
 
-# 7. Install pip dependencies within the venv
+# 7. Install pip dependencies within the virtual environment
 log_info "Installing pip dependencies (ansi2html) into the virtual environment..."
-# Activate venv is tricky in scripts, directly call the venv's python/pip
+# Activate venv is tricky in scripts; directly call the venv's python/pip instead.
+# Ensure pip is up-to-date within the venv
 "${VENV_PATH}/bin/python" -m pip install --upgrade pip || log_warning "Failed to upgrade pip in venv. Continuing..."
-"${VENV_PATH}/bin/python" -m pip install ansi2html || log_error "Failed to install pip dependencies in venv."
-log_info "Pip dependencies installed."
+# Install required packages
+# Note: PyQt6 should ideally be handled by emerge on Gentoo (done in step 4)
+"${VENV_PATH}/bin/python" -m pip install ansi2html || log_error "Failed to install pip dependencies (ansi2html) in venv."
+log_info "Pip dependencies installed within the virtual environment."
 
-# 1. Create and move the launcher script to /usr/local/bin
+# 8. Create the launcher script in /usr/local/bin
 log_info "Creating launcher script at ${LAUNCHER_PATH}..."
-# Use a 'here document' (EOF) to create the script content
+# Use a 'here document' (EOF) to create the script content.
+# Using 'exec' replaces the shell process with the Python process.
 cat > "${LAUNCHER_PATH}" << EOF
 #!/bin/bash
-# Launcher for PortageGUI
+# Launcher for ${APP_NAME}
+# Executes the application using its dedicated virtual environment Python interpreter.
 
-# Activate venv (alternative: directly call python)
-# source "${VENV_PATH}/bin/activate"
-# python "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" "\$@"
+VENV_PYTHON="${VENV_PATH}/bin/python"
+APP_SCRIPT="${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
 
-# Direct execution with venv's python (often more reliable in scripts)
-exec "${VENV_PATH}/bin/python" "${VENV_DIR}/${PYTHON_SCRIPT_NAME}" "\$@"
+# Check if Python interpreter exists
+if [[ ! -x "\${VENV_PYTHON}" ]]; then
+  echo "[ERROR] Python interpreter not found or not executable: \${VENV_PYTHON}" >&2
+  exit 1
+fi
+
+# Check if App script exists
+if [[ ! -f "\${APP_SCRIPT}" ]]; then
+  echo "[ERROR] Application script not found: \${APP_SCRIPT}" >&2
+  exit 1
+fi
+
+# Use exec to replace the bash script process with the Python process
+# Pass all command-line arguments ("\$@") to the Python script
+exec "\${VENV_PYTHON}" "\${APP_SCRIPT}" "\$@"
 
 EOF
 
-# 8. Make the launcher script executable
+# 9. Make the launcher script executable
 log_info "Making launcher script executable..."
-chmod +x "${LAUNCHER_PATH}" || log_error "Failed to make launcher script executable."
+chmod 755 "${LAUNCHER_PATH}" || log_error "Failed to make launcher script executable."
+# Ensure ownership is root, as it's in /usr/local/bin
+chown root:root "${LAUNCHER_PATH}"
 log_info "Launcher script created and set as executable: ${LAUNCHER_PATH}"
 
-# 2. Add aliases
+# 10. Create system-wide aliases
 log_info "Adding system-wide aliases to ${ALIAS_FILE}..."
-# Create/overwrite the alias file
+# Create/overwrite the alias file. Using the full path to the launcher is robust.
 cat > "${ALIAS_FILE}" << EOF
-# Aliases for PortageGUI
-alias portagegui='${LAUNCHER_NAME}'
-alias pgui='${LAUNCHER_NAME}'
+# Aliases for ${APP_NAME}
+# Generated by installation script on $(date)
+
+alias portagegui='${LAUNCHER_PATH}'
+alias pgui='${LAUNCHER_PATH}'
+
 EOF
-chmod 644 "${ALIAS_FILE}" # Make it readable by all
-log_info "Aliases 'portagegui' and 'pgui' created."
-log_info "You may need to log out and log back in or run 'source ${ALIAS_FILE}' for aliases to take effect in your current shell."
+chmod 644 "${ALIAS_FILE}" # Make it readable by all users
+chown root:root "${ALIAS_FILE}"
+log_info "Aliases 'portagegui' and 'pgui' defined in ${ALIAS_FILE}."
+log_warning "IMPORTANT: For the new aliases to work, you must either:"
+log_warning "  a) Log out and log back in."
+log_warning "  b) Manually source the file in your current shell: source ${ALIAS_FILE}"
 
 # --- Final Steps ---
 log_info ""
 log_info "-----------------------------------------------------"
-log_info " PortageGUI Installation Complete!"
+log_info " ${APP_NAME} Installation Complete!"
 log_info "-----------------------------------------------------"
-log_info " - Dependencies installed via emerge."
+log_info " - System dependencies installed via emerge (including PyQt6)."
 log_info " - Virtual environment created at: ${VENV_PATH}"
-log_info " - Python script installed at: ${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
+log_info " - App script installed at: ${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
+log_info " - Pip dependencies (ansi2html) installed in venv."
 log_info " - Launcher installed at: ${LAUNCHER_PATH}"
-log_info " - Aliases 'portagegui' and 'pgui' created in ${ALIAS_FILE}."
+log_info " - Aliases ('portagegui', 'pgui') created in: ${ALIAS_FILE}"
 log_info ""
-log_info "To run the application, you can now use:"
+log_info "To run the application, you can now use the command:"
 log_info "   ${LAUNCHER_NAME}"
-log_info " or the aliases (after new login or sourcing profile):"
+log_info ""
+log_info "Or, AFTER starting a new login shell (or sourcing ${ALIAS_FILE}), use the aliases:"
 log_info "   portagegui"
 log_info "   pgui"
 log_info ""
