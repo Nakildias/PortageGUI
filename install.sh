@@ -60,16 +60,20 @@ log_info "Found Python script: ${SCRIPT_SOURCE_PATH}"
 
 # --- Installation Steps ---
 
-# 4. Install Gentoo system dependencies (emerge)
+# 4. Install/Update Gentoo system dependencies (emerge)
+#    - Uses --update --deep --newuse (-uDN) to only install/update missing,
+#      outdated, or packages with changed USE flags. Prevents reinstalling
+#      already up-to-date packages.
 #    - dev-python/pyqt6: Provides Qt6 bindings AND ensures system Qt6 libs are present.
 #                        *** Using emerge is strongly recommended over pip for PyQt6 on Gentoo. ***
 #    - app-portage/gentoolkit: Provides 'equery' (often used in Portage helper scripts).
 #    - app-portage/eix: Provides 'eix' (optional alternative/addition to equery).
 #    - sys-auth/polkit: Provides 'pkexec' for running commands as root from the GUI.
-log_info "Installing required Gentoo packages using emerge..."
+log_info "Ensuring required Gentoo packages are installed/updated using emerge..."
 log_info "This step requires user confirmation ('--ask'). Dependencies: dev-python/pyqt6, app-portage/gentoolkit, app-portage/eix, sys-auth/polkit"
-emerge --ask --verbose dev-python/pyqt6 app-portage/gentoolkit app-portage/eix sys-auth/polkit || log_error "Failed to install emerge dependencies. Check emerge output for details."
-log_info "Emerge dependencies installation command finished."
+# Use --update --deep --newuse (-uDN) to avoid reinstalling packages already installed and up-to-date
+emerge --ask --verbose --update --deep --newuse dev-python/pyqt6 app-portage/gentoolkit app-portage/eix sys-auth/polkit || log_error "Failed to install/update emerge dependencies. Check emerge output for details."
+log_info "Emerge dependency check/installation command finished."
 
 # 5. Create application directory and Python virtual environment
 log_info "Setting up application directory and Python virtual environment..."
@@ -98,6 +102,8 @@ if [[ ! -d "${VENV_PATH}" ]]; then
     log_info "Creating Python virtual environment at '${VENV_PATH}'..."
     "${PYTHON3_EXEC}" -m venv "${VENV_PATH}" || log_error "Failed to create Python virtual environment."
     log_info "Virtual environment created."
+else
+    log_info "Virtual environment '${VENV_PATH}' already exists. Skipping creation."
 fi
 
 # 6. Copy Python script to the application directory
@@ -178,8 +184,8 @@ log_info ""
 log_info "-----------------------------------------------------"
 log_info " ${APP_NAME} Installation Complete!"
 log_info "-----------------------------------------------------"
-log_info " - System dependencies installed via emerge (including PyQt6)."
-log_info " - Virtual environment created at: ${VENV_PATH}"
+log_info " - System dependencies checked/installed/updated via emerge (including PyQt6)."
+log_info " - Virtual environment setup at: ${VENV_PATH}"
 log_info " - App script installed at: ${VENV_DIR}/${PYTHON_SCRIPT_NAME}"
 log_info " - Pip dependencies (ansi2html) installed in venv."
 log_info " - Launcher installed at: ${LAUNCHER_PATH}"
